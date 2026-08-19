@@ -1,8 +1,9 @@
-use endex::{index::Index, search, store, watch};
+use endex::{embed, index::Index, search, store, watch};
+use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const CACHE_FILENAME: &str = ".endex-index.bin";
 
@@ -11,77 +12,132 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("index") => cmd_index(&args[1..]),
         Some("search") => cmd_search(&args[1..]),
+        Some("ask") => cmd_ask(&args[1..]),
+        Some("graph") => cmd_graph(&args[1..]),
+        Some("flow") => cmd_flow(&args[1..]),
+        Some("clues") => cmd_clues(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
-        _ => {
-            eprintln!(
-                "endex — fast cached code indexer with millisecond search\n\n\
-                 USAGE:\n\
-                 \x20 endex index  [DIR]          build or refresh the cache for DIR (default: .)\n\
-                 \x20 endex search [DIR] QUERY    one-shot search using the cache\n\
-                 \x20 endex watch  [DIR]          watch for changes + interactive search REPL\n\n\
-                 OPTIONS:\n\
-                 \x20 --limit N    max results (default 50)\n\
-                 \x20 --no-cache   ignore the on-disk cache and rebuild from scratch\n\n\
-                 The cache is stored as {CACHE_FILENAME} inside the indexed directory."
-            );
-            std::process::exit(2);
-        }
+        _ => usage(),
     }
 }
 
-// ---------- arg helpers ----------
+fn usage() -> ! {
+    eprintln!(
+        "endex — fast cached code indexer: trigram search + knowledge graph + hybrid semantic search
+
+USAGE:
+  endex index  [DIR]              build or refresh the cache for DIR (default: .)
+  endex search [DIR] QUERY        fast lexical substring search
+  endex ask    [DIR] QUERY        hybrid search: lexical + semantic embeddings
+  endex graph  [DIR] SYMBOL       show a symbol's callers / callees / importers
+  endex flow   [DIR] FROM TO      find call-graph paths between two symbols
+  endex clues  [DIR] TERM         code blocks mentioning TERM + their symbols
+  endex watch  [DIR]              watch for changes + interactive REPL
+
+OPTIONS:
+  --limit N            max results (default 50)
+  --no-cache           ignore the on-disk cache and rebuild from scratch
+  --embed-provider P   hash (offline, default) | openai (any OpenAI-compatible
+                       endpoint: OpenAI, Ollama, LM Studio, vLLM, ...)
+  --embed-url URL      e.g. http://localhost:11434/v1   (env EMBED_URL)
+  --embed-model M      e.g. text-embedding-3-small, nomic-embed-text (env EMBED_MODEL)
+  --embed-key KEY      API key (env EMBED_API_KEY / OPENAI_API_KEY)
+  --embed-dim N        hash embedding dimensions (default 256)
+  --embed-batch N      remote embedding batch size (default 64)
+
+REPL (watch mode):
+  QUERY            lexical search          ? QUERY   hybrid semantic search
+  :graph NAME      symbol neighborhood     :flow A B call paths
+  :clues TERM      blocks + symbols        :embed    build/refresh embeddings
+  :limit N  :save  :stats  :quit
+
+The cache is stored as {CACHE_FILENAME} inside the indexed directory."
+    );
+    std::process::exit(2);
+}
+
+// ---------- arg parsing ----------
 
 struct Opts {
     dir: PathBuf,
-    query: Option<String>,
+    terms: Vec<String>,
     limit: usize,
     use_cache: bool,
+    embed: EmbedOpts,
+}
+
+#[derive(Default)]
+struct EmbedOpts {
+    provider: Option<String>,
+    model: Option<String>,
+    url: Option<String>,
+    key: Option<String>,
+    dim: Option<usize>,
+    batch: Option<usize>,
 }
 
 fn parse_opts(args: &[String]) -> Opts {
     let mut opts = Opts {
         dir: PathBuf::from("."),
-        query: None,
+        terms: Vec::new(),
         limit: 50,
         use_cache: true,
+        embed: EmbedOpts::default(),
     };
-    let mut positional: Vec<&String> = Vec::new();
+    let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
+        let next = |i: &mut usize| -> Option<String> {
+            *i += 1;
+            args.get(*i).cloned()
+        };
         match args[i].as_str() {
             "--limit" | "-l" => {
-                if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                if let Some(v) = next(&mut i).and_then(|s| s.parse().ok()) {
                     opts.limit = v;
-                    i += 1;
                 }
             }
             "--no-cache" => opts.use_cache = false,
-            _ => positional.push(&args[i]),
+            "--embed-provider" => opts.embed.provider = next(&mut i),
+            "--embed-model" => opts.embed.model = next(&mut i),
+            "--embed-url" => opts.embed.url = next(&mut i),
+            "--embed-key" => opts.embed.key = next(&mut i),
+            "--embed-dim" => opts.embed.dim = next(&mut i).and_then(|s| s.parse().ok()),
+            "--embed-batch" => opts.embed.batch = next(&mut i).and_then(|s| s.parse().ok()),
+            _ => positional.push(args[i].clone()),
         }
         i += 1;
     }
     if let Some(dir) = positional.first() {
         opts.dir = PathBuf::from(dir);
     }
-    if let Some(q) = positional.get(1) {
-        opts.query = Some(q.to_string());
-    }
+    opts.terms = positional.into_iter().skip(1).collect();
     opts
+}
+
+fn provider_from(opts: &Opts) -> embed::Provider {
+    embed::Provider::resolve(
+        opts.embed.provider.as_deref(),
+        opts.embed.model.as_deref(),
+        opts.embed.url.as_deref(),
+        opts.embed.key.as_deref(),
+        opts.embed.dim,
+        opts.embed.batch,
+    )
 }
 
 // ---------- load-or-build ----------
 
-/// Load the cache if present & valid, else full build. Always refreshes
-/// incrementally afterwards so results are never stale.
 fn load_or_build(root: &Path, use_cache: bool) -> Index {
     let t0 = Instant::now();
     let mut idx = if use_cache {
         match store::load(root) {
             Some(i) => {
                 eprintln!(
-                    "  cache loaded: {} files / {} blocks in {:?}",
+                    "  cache loaded: {} files / {} blocks / {} symbols in {:?}",
                     i.file_count(),
                     i.block_count(),
+                    i.graph.symbols.len(),
                     t0.elapsed()
                 );
                 i
@@ -112,6 +168,8 @@ fn load_or_build(root: &Path, use_cache: bool) -> Index {
             t1.elapsed()
         );
         let _ = store::save(&idx, root);
+    } else if idx.graph.symbols.is_empty() && !idx.files.is_empty() {
+        idx.finalize(); // cache predates the knowledge graph
     }
     idx
 }
@@ -120,42 +178,274 @@ fn load_or_build(root: &Path, use_cache: bool) -> Index {
 
 fn cmd_index(args: &[String]) {
     let opts = parse_opts(args);
-    let root = opts.dir.canonicalize().unwrap_or(opts.dir);
+    let root = opts.dir.canonicalize().unwrap_or_else(|_| opts.dir.clone());
     eprintln!("Indexing {} ...", root.display());
     let t0 = Instant::now();
     let idx = load_or_build(&root, opts.use_cache);
     eprintln!(
-        "Done: {} files, {} blocks, {} trigram lists — total {:?}",
+        "Done: {} files, {} blocks, {} symbols, {} call edges, {} file imports — total {:?}",
         idx.file_count(),
         idx.block_count(),
-        idx.postings.len(),
+        idx.graph.symbols.len(),
+        idx.graph.call_edge_count(),
+        idx.graph.file_imports.len(),
         t0.elapsed()
     );
 }
 
 fn cmd_search(args: &[String]) {
     let opts = parse_opts(args);
-    let Some(query) = opts.query else {
-        eprintln!("error: search requires a QUERY (quoted if it has spaces)");
+    let query = opts.terms.join(" ");
+    if query.is_empty() {
+        eprintln!("error: search requires a QUERY (quote it if it has spaces)");
         std::process::exit(2);
-    };
-    let root = opts.dir.canonicalize().unwrap_or(opts.dir);
+    }
+    let root = opts.dir.canonicalize().unwrap_or_else(|_| opts.dir.clone());
     let idx = load_or_build(&root, opts.use_cache);
     let t = Instant::now();
     let hits = search::search(&idx, &query, opts.limit);
-    let search_time = t.elapsed();
-    print_hits(&idx, &hits, &query, opts.limit, search_time);
+    print_hits(&idx, &hits, &query, opts.limit, t.elapsed());
 }
+
+fn cmd_ask(args: &[String]) {
+    let opts = parse_opts(args);
+    let query = opts.terms.join(" ");
+    if query.is_empty() {
+        eprintln!("error: ask requires a QUERY");
+        std::process::exit(2);
+    }
+    let root = opts.dir.canonicalize().unwrap_or_else(|_| opts.dir.clone());
+    let mut idx = load_or_build(&root, opts.use_cache);
+    let prov = provider_from(&opts);
+    let t = Instant::now();
+    match embed::ask(&mut idx, &prov, &query, opts.limit) {
+        Ok((hits, changed)) => {
+            let dt = t.elapsed();
+            println!(
+                "\x1b[1m{}\x1b[0m block(s) matched in \x1b[1m{:.2?}\x1b[0m (hybrid: lexical + semantic, {})",
+                hits.len(),
+                dt,
+                prov.id()
+            );
+            print_ask_hits(&idx, &hits, &query);
+            if changed {
+                let _ = store::save(&idx, &root);
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: semantic search unavailable ({e}); falling back to lexical");
+            let hits = search::search(&idx, &query, opts.limit);
+            print_hits(&idx, &hits, &query, opts.limit, t.elapsed());
+        }
+    }
+}
+
+fn cmd_graph(args: &[String]) {
+    let opts = parse_opts(args);
+    let name = opts.terms.join(" ");
+    if name.is_empty() {
+        eprintln!("error: graph requires a SYMBOL name");
+        std::process::exit(2);
+    }
+    let root = opts.dir.canonicalize().unwrap_or_else(|_| opts.dir.clone());
+    let idx = load_or_build(&root, opts.use_cache);
+    let g = &idx.graph;
+    let syms = g.find_all(&name);
+    if syms.is_empty() {
+        eprintln!("no symbol named '{name}' found.");
+        let sugg = g.suggest(&name);
+        if !sugg.is_empty() {
+            eprintln!("did you mean: {} ?", sugg.join(", "));
+        }
+        std::process::exit(1);
+    }
+    for id in syms {
+        print_symbol(&idx, g, id);
+    }
+}
+
+fn print_symbol(idx: &Index, g: &endex::graph::Graph, id: u32) {
+    let s = &g.symbols[id as usize];
+    println!(
+        "\x1b[1m{}\x1b[0m  [{}]  \x1b[36m{}:{}\x1b[0m",
+        s.name,
+        s.kind.label(),
+        idx.path_of(s.file),
+        s.line
+    );
+    let callees = g.callees(id);
+    if !callees.is_empty() {
+        println!("  \x1b[2mcalls:\x1b[0m");
+        for &c in callees.iter().take(20) {
+            let t = &g.symbols[c as usize];
+            println!(
+                "    → {}  \x1b[2m{}:{}\x1b[0m",
+                t.name,
+                idx.path_of(t.file),
+                t.line
+            );
+        }
+        if callees.len() > 20 {
+            println!("    \x1b[2m··· {} total\x1b[0m", callees.len());
+        }
+    }
+    let callers = g.callers(id);
+    if !callers.is_empty() {
+        println!("  \x1b[2mcalled by:\x1b[0m");
+        for &c in callers.iter().take(20) {
+            let t = &g.symbols[c as usize];
+            println!(
+                "    ← {}  \x1b[2m{}:{}\x1b[0m",
+                t.name,
+                idx.path_of(t.file),
+                t.line
+            );
+        }
+        if callers.len() > 20 {
+            println!("    \x1b[2m··· {} total\x1b[0m", callers.len());
+        }
+    }
+    let importers: Vec<&str> = g
+        .file_imports
+        .iter()
+        .filter(|(_, to)| *to == s.file)
+        .map(|(from, _)| idx.path_of(*from))
+        .take(10)
+        .collect();
+    if !importers.is_empty() {
+        println!("  \x1b[2mimported by:\x1b[0m {}", importers.join(", "));
+    }
+    println!();
+}
+
+fn cmd_flow(args: &[String]) {
+    let opts = parse_opts(args);
+    if opts.terms.len() < 2 {
+        eprintln!("error: flow requires two symbol names: endex flow [DIR] FROM TO");
+        std::process::exit(2);
+    }
+    let (from, to) = (opts.terms[0].clone(), opts.terms[1].clone());
+    let root = opts.dir.canonicalize().unwrap_or_else(|_| opts.dir.clone());
+    let idx = load_or_build(&root, opts.use_cache);
+    let g = &idx.graph;
+    let sources = g.find_all(&from);
+    let targets: HashSet<u32> = g.find_all(&to).into_iter().collect();
+    if sources.is_empty() {
+        eprintln!(
+            "no symbol named '{from}' found. did you mean: {} ?",
+            g.suggest(&from).join(", ")
+        );
+        std::process::exit(1);
+    }
+    if targets.is_empty() {
+        eprintln!(
+            "no symbol named '{to}' found. did you mean: {} ?",
+            g.suggest(&to).join(", ")
+        );
+        std::process::exit(1);
+    }
+    let paths = g.find_paths(&sources, &targets, 8, 5);
+    if paths.is_empty() {
+        println!("no call path found from '{from}' to '{to}' (max depth 8)");
+        return;
+    }
+    println!(
+        "{} path(s) from \x1b[1m{from}\x1b[0m to \x1b[1m{to}\x1b[0m:",
+        paths.len()
+    );
+    for p in &paths {
+        let mut first = true;
+        println!();
+        for &sid in p {
+            let s = &g.symbols[sid as usize];
+            if first {
+                print!(
+                    "\x1b[1m{}\x1b[0m \x1b[2m{}:{}\x1b[0m",
+                    s.name,
+                    idx.path_of(s.file),
+                    s.line
+                );
+                first = false;
+            } else {
+                print!(
+                    "\n  \x1b[2m--calls-->\x1b[0m \x1b[1m{}\x1b[0m \x1b[2m{}:{}\x1b[0m",
+                    s.name,
+                    idx.path_of(s.file),
+                    s.line
+                );
+            }
+        }
+        println!();
+    }
+}
+
+fn cmd_clues(args: &[String]) {
+    let opts = parse_opts(args);
+    let term = opts.terms.join(" ");
+    if term.is_empty() {
+        eprintln!("error: clues requires a TERM");
+        std::process::exit(2);
+    }
+    let root = opts.dir.canonicalize().unwrap_or_else(|_| opts.dir.clone());
+    let idx = load_or_build(&root, opts.use_cache);
+    let g = &idx.graph;
+    let t = Instant::now();
+    let hits = search::search(&idx, &term, 15);
+    println!(
+        "clues for '{term}' — {} block(s) in \x1b[1m{:.2?}\x1b[0m",
+        hits.len(),
+        t.elapsed()
+    );
+    for hit in &hits {
+        println!("\x1b[1;36m{}:{}\x1b[0m", idx.path_of(hit.file_id), hit.line);
+        if let Some(syms) = g.by_block.get(&hit.block_id) {
+            for &sid in syms {
+                let s = &g.symbols[sid as usize];
+                let callers: Vec<String> = g
+                    .callers(sid)
+                    .iter()
+                    .take(6)
+                    .map(|&c| g.symbols[c as usize].name.clone())
+                    .collect();
+                let callees: Vec<String> = g
+                    .callees(sid)
+                    .iter()
+                    .take(6)
+                    .map(|&c| g.symbols[c as usize].name.clone())
+                    .collect();
+                println!(
+                    "  \x1b[1m{}\x1b[0m [{}] — called by: {} · calls: {}",
+                    s.name,
+                    s.kind.label(),
+                    if callers.is_empty() {
+                        "-".into()
+                    } else {
+                        callers.join(", ")
+                    },
+                    if callees.is_empty() {
+                        "-".into()
+                    } else {
+                        callees.join(", ")
+                    }
+                );
+            }
+        }
+        print_block_matches(&hit.text, hit.line, &term.to_lowercase(), 2);
+    }
+}
+
+// ---------- watch ----------
 
 fn cmd_watch(args: &[String]) {
     let opts = parse_opts(args);
-    let root = opts.dir.canonicalize().unwrap_or(opts.dir);
+    let root = opts.dir.canonicalize().unwrap_or_else(|_| opts.dir.clone());
     eprintln!("Indexing {} ...", root.display());
     let mut idx = load_or_build(&root, opts.use_cache);
     eprintln!(
-        "Ready: {} files / {} blocks indexed. Watching for changes...",
+        "Ready: {} files / {} blocks / {} symbols. Watching for changes...",
         idx.file_count(),
-        idx.block_count()
+        idx.block_count(),
+        idx.graph.symbols.len()
     );
 
     let rx = match watch::watch(&root) {
@@ -172,7 +462,6 @@ fn cmd_watch(args: &[String]) {
     }
     let (tx, msg_rx) = mpsc::channel();
 
-    // stdin reader thread.
     let tx_in = tx.clone();
     std::thread::spawn(move || {
         let stdin = io::stdin();
@@ -187,7 +476,6 @@ fn cmd_watch(args: &[String]) {
             }
         }
     });
-    // watcher forwarder thread.
     std::thread::spawn(move || {
         while let Ok(batch) = rx.recv() {
             if tx.send(Msg::Changed(batch)).is_err() {
@@ -198,7 +486,12 @@ fn cmd_watch(args: &[String]) {
 
     let mut dirty = false;
     let mut limit = opts.limit;
-    println!("Type a query and press Enter. Commands: :limit N  :save  :stats  :quit");
+    let mut prov = provider_from(&opts);
+    println!(
+        "Type a query and press Enter. Prefix with ? for hybrid semantic search ({}).
+Commands: :graph N  :flow A B  :clues T  :embed [provider]  :limit N  :save  :stats  :quit",
+        prov.id()
+    );
     print!("search> ");
     let _ = io::stdout().flush();
 
@@ -214,26 +507,141 @@ fn cmd_watch(args: &[String]) {
                         dirty = false;
                     }
                     ":stats" => println!(
-                        "{} files / {} blocks / {} trigram lists{}",
+                        "{} files / {} blocks / {} symbols / {} call edges / {} embeddings{}",
                         idx.file_count(),
                         idx.block_count(),
-                        idx.postings.len(),
+                        idx.graph.symbols.len(),
+                        idx.graph.call_edge_count(),
+                        idx.embeddings.map.len(),
                         if dirty { " (unsaved changes)" } else { "" }
                     ),
-                    _ if line.starts_with(":limit") => {
-                        if let Some(v) = line.split_whitespace().nth(1).and_then(|s| s.parse().ok())
-                        {
-                            limit = v;
-                            println!("limit set to {v}");
+                    _ if line == ":embed" || line.starts_with(":embed ") => {
+                        if let Some(p) = line.strip_prefix(":embed").map(str::trim) {
+                            if !p.is_empty() {
+                                prov =
+                                    embed::Provider::resolve(Some(p), None, None, None, None, None);
+                            }
+                        }
+                        match embed::ensure_all(&mut idx, &prov) {
+                            Ok(()) => {
+                                dirty = true;
+                                println!(
+                                    "embeddings ready: {} vectors, {} dim ({})",
+                                    idx.embeddings.map.len(),
+                                    idx.embeddings.dim,
+                                    prov.id()
+                                );
+                            }
+                            Err(e) => println!("embed failed: {e}"),
+                        }
+                    }
+                    _ if line.starts_with(':') => {
+                        let mut parts = line.split_whitespace();
+                        let cmd = parts.next().unwrap_or("");
+                        let rest: Vec<&str> = parts.collect();
+                        match (cmd, rest.as_slice()) {
+                            (":graph", [name]) => {
+                                let g = &idx.graph;
+                                let syms = g.find_all(name);
+                                if syms.is_empty() {
+                                    println!("no symbol named '{name}'");
+                                } else {
+                                    for id in syms {
+                                        print_symbol(&idx, g, id);
+                                    }
+                                }
+                            }
+                            (":flow", [a, b]) => {
+                                let g = &idx.graph;
+                                let sources = g.find_all(a);
+                                let targets: HashSet<u32> = g.find_all(b).into_iter().collect();
+                                let paths = g.find_paths(&sources, &targets, 8, 5);
+                                if paths.is_empty() {
+                                    println!("no call path from {a} to {b}");
+                                }
+                                for p in &paths {
+                                    let mut first = true;
+                                    println!();
+                                    for &sid in p {
+                                        let s = &g.symbols[sid as usize];
+                                        if first {
+                                            print!(
+                                                "\x1b[1m{}\x1b[0m \x1b[2m{}:{}\x1b[0m",
+                                                s.name,
+                                                idx.path_of(s.file),
+                                                s.line
+                                            );
+                                            first = false;
+                                        } else {
+                                            print!("\n  \x1b[2m--calls-->\x1b[0m \x1b[1m{}\x1b[0m \x1b[2m{}:{}\x1b[0m",
+                                                s.name, idx.path_of(s.file), s.line);
+                                        }
+                                    }
+                                    println!();
+                                }
+                            }
+                            (":clues", terms) if !terms.is_empty() => {
+                                let term = terms.join(" ");
+                                let g = &idx.graph;
+                                let hits = search::search(&idx, &term, 10);
+                                for hit in &hits {
+                                    println!(
+                                        "\x1b[1;36m{}:{}\x1b[0m",
+                                        idx.path_of(hit.file_id),
+                                        hit.line
+                                    );
+                                    if let Some(syms) = g.by_block.get(&hit.block_id) {
+                                        for &sid in syms {
+                                            let s = &g.symbols[sid as usize];
+                                            println!(
+                                                "  \x1b[1m{}\x1b[0m [{}]",
+                                                s.name,
+                                                s.kind.label()
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            (":limit", [n]) => {
+                                if let Ok(v) = n.parse::<usize>() {
+                                    limit = v;
+                                    println!("limit set to {v}");
+                                }
+                            }
+                            _ => println!(
+                                "unknown command: {line} (try :graph, :flow, :clues, :embed)"
+                            ),
+                        }
+                    }
+                    _ if line.starts_with('?') => {
+                        let q = line[1..].trim().to_string();
+                        if q.is_empty() {
+                            println!("usage: ? QUERY");
                         } else {
-                            println!("usage: :limit N");
+                            let t = Instant::now();
+                            match embed::ask(&mut idx, &prov, &q, limit) {
+                                Ok((hits, changed)) => {
+                                    dirty |= changed;
+                                    println!(
+                                        "\x1b[1m{}\x1b[0m block(s) matched in \x1b[1m{:.2?}\x1b[0m (hybrid, {})",
+                                        hits.len(),
+                                        t.elapsed(),
+                                        prov.id()
+                                    );
+                                    print_ask_hits(&idx, &hits, &q);
+                                }
+                                Err(e) => {
+                                    eprintln!("semantic search failed: {e}");
+                                    let hits = search::search(&idx, &q, limit);
+                                    print_hits(&idx, &hits, &q, limit, t.elapsed());
+                                }
+                            }
                         }
                     }
                     _ => {
                         let t = Instant::now();
                         let hits = search::search(&idx, &line, limit);
-                        let search_time = t.elapsed();
-                        print_hits(&idx, &hits, &line, limit, search_time);
+                        print_hits(&idx, &hits, &line, limit, t.elapsed());
                     }
                 }
                 print!("search> ");
@@ -246,7 +654,6 @@ fn cmd_watch(args: &[String]) {
                         idx.remove_file(p);
                         continue;
                     }
-                    // Skip our own cache file and anything under .git.
                     if p.file_name().map(|f| f == CACHE_FILENAME).unwrap_or(false)
                         || p.components().any(|c| c.as_os_str() == ".git")
                     {
@@ -257,8 +664,9 @@ fn cmd_watch(args: &[String]) {
                     }
                 }
                 if n > 0 {
+                    idx.finalize(); // rebuild graph + GC embeddings in memory
                     dirty = true;
-                    eprintln!("\x1b[2m  · reindexed {n} changed file(s)\x1b[0m");
+                    eprintln!("\x1b[2m  · reindexed {n} changed file(s), graph refreshed\x1b[0m");
                     print!("search> ");
                     let _ = io::stdout().flush();
                 }
@@ -276,13 +684,7 @@ fn cmd_watch(args: &[String]) {
 
 // ---------- output ----------
 
-fn print_hits(
-    idx: &Index,
-    hits: &[search::Hit],
-    query: &str,
-    limit: usize,
-    search_time: std::time::Duration,
-) {
+fn print_hits(idx: &Index, hits: &[search::Hit], query: &str, limit: usize, search_time: Duration) {
     let q = query.to_lowercase();
     let total = hits.len();
     println!(
@@ -296,40 +698,54 @@ fn print_hits(
     );
 
     let mut stdout = io::stdout().lock();
+    let _ = stdout.flush();
+    drop(stdout);
     for hit in hits {
-        let path = idx.path_of(hit.file_id);
-        let _ = write!(stdout, "\x1b[1;36m{}:{}\x1b[0m", path, hit.line);
-        // Show the matching lines of the block (with line numbers).
-        let mut shown = 0;
-        let mut lineno = hit.line;
-        for line in hit.text.lines() {
-            let l = lineno;
-            lineno += 1;
-            if !line.to_lowercase().contains(&q) {
-                continue;
-            }
-            if shown == 6 {
-                let _ = writeln!(stdout, "\x1b[2m  ··· (more matches in this block)\x1b[0m");
-                break;
-            }
-            let _ = writeln!(stdout);
-            let _ = write!(stdout, "  \x1b[2m{l:>5}|\x1b[0m ");
-            let lower = line.to_lowercase();
-            let mut start = 0usize;
-            // highlight every match in the line
-            while let Some(pos) = lower[start..].find(&q) {
-                let abs = start + pos;
-                let _ = write!(stdout, "{}", &line[start..abs]);
-                let _ = write!(
-                    stdout,
-                    "\x1b[1;31m{}\x1b[0m",
-                    &line[abs..abs + q.len().min(line.len() - abs)]
-                );
-                start = abs + q.len().max(1);
-            }
-            let _ = writeln!(stdout, "{}", &line[start..]);
-            shown += 1;
+        println!("\x1b[1;36m{}:{}\x1b[0m", idx.path_of(hit.file_id), hit.line);
+        print_block_matches(&hit.text, hit.line, &q, 6);
+    }
+}
+
+fn print_ask_hits(idx: &Index, hits: &[(f32, search::Hit)], query: &str) {
+    let q = query.to_lowercase();
+    for (score, hit) in hits {
+        println!(
+            "\x1b[1;36m{}:{}\x1b[0m  \x1b[2mscore {score:.4}\x1b[0m",
+            idx.path_of(hit.file_id),
+            hit.line
+        );
+        print_block_matches(&hit.text, hit.line, &q, 4);
+    }
+}
+
+/// Print the matching lines of a block with line numbers and highlights.
+fn print_block_matches(text: &str, start_line: u32, q: &str, max_lines: usize) {
+    let mut stdout = io::stdout().lock();
+    let mut shown = 0;
+    let mut lineno = start_line;
+    for line in text.lines() {
+        let l = lineno;
+        lineno += 1;
+        if !line.to_lowercase().contains(q) {
+            continue;
         }
+        if shown == max_lines {
+            let _ = writeln!(stdout, "\x1b[2m  ··· (more matches in this block)\x1b[0m");
+            break;
+        }
+        let _ = writeln!(stdout);
+        let _ = write!(stdout, "  \x1b[2m{l:>5}|\x1b[0m ");
+        let lower = line.to_lowercase();
+        let mut start = 0usize;
+        while let Some(pos) = lower[start..].find(q) {
+            let abs = start + pos;
+            let _ = write!(stdout, "{}", &line[start..abs]);
+            let end = (abs + q.len()).min(line.len());
+            let _ = write!(stdout, "\x1b[1;31m{}\x1b[0m", &line[abs..end]);
+            start = end.max(abs + 1);
+        }
+        let _ = writeln!(stdout, "{}", &line[start..]);
+        shown += 1;
     }
     let _ = stdout.flush();
 }

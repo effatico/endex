@@ -1,4 +1,5 @@
-//! Trigram inverted index over "code blocks" (blank-line-separated chunks).
+//! Trigram inverted index over "code blocks" (blank-line-separated chunks),
+//! plus the knowledge graph and embedding store derived from them.
 //!
 //! Design (same family as Google Code Search / Zoekt):
 //!   - The corpus is split into *blocks* (contiguous non-blank lines, capped).
@@ -14,6 +15,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::embed::Embeddings;
+use crate::graph::{self, Def, Graph};
+
 pub const MAX_FILE_SIZE: u64 = 5 * 1024 * 1024; // skip files larger than 5 MB
 pub const BLOCK_MAX_LINES: usize = 80; // split blocks longer than this
 pub const TOMBSTONE_FILE: u32 = u32::MAX;
@@ -24,6 +28,9 @@ pub struct FileEntry {
     pub mtime: u64,
     pub len: u64,
     pub blocks: Vec<u32>,
+    /// definitions extracted at index time (sorted by line)
+    #[serde(default)]
+    pub defs: Vec<Def>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -43,6 +50,12 @@ pub struct Index {
     pub free_blocks: Vec<u32>,
     /// trigram (3 bytes packed into u32) -> sorted list of block ids
     pub postings: HashMap<u32, Vec<u32>>,
+    /// knowledge graph (symbols, call edges, imports)
+    #[serde(default)]
+    pub graph: Graph,
+    /// semantic embeddings, keyed by block content hash
+    #[serde(default)]
+    pub embeddings: Embeddings,
 }
 
 // ---------- parsing ----------
@@ -53,8 +66,13 @@ struct ParsedBlock {
     trigrams: Vec<u32>,
 }
 
-/// One file parsed off-disk: (path, mtime, size, blocks).
-type ParsedFile = (PathBuf, u64, u64, Vec<ParsedBlock>);
+struct ParsedFile {
+    path: PathBuf,
+    mtime: u64,
+    len: u64,
+    blocks: Vec<ParsedBlock>,
+    defs: Vec<Def>,
+}
 
 /// Split text into blank-line-separated blocks (capped at BLOCK_MAX_LINES).
 fn parse_blocks(text: &str) -> Vec<ParsedBlock> {
@@ -62,7 +80,7 @@ fn parse_blocks(text: &str) -> Vec<ParsedBlock> {
     let mut cur: Vec<&str> = Vec::new();
     let mut start_line: u32 = 1;
 
-    let flush = |cur: &mut Vec<&str>, start_line: u32, blocks: &mut Vec<ParsedBlock>| {
+    fn flush(cur: &mut Vec<&str>, start_line: u32, blocks: &mut Vec<ParsedBlock>) {
         if cur.is_empty() {
             return;
         }
@@ -74,7 +92,7 @@ fn parse_blocks(text: &str) -> Vec<ParsedBlock> {
             trigrams,
         });
         cur.clear();
-    };
+    }
 
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -201,6 +219,7 @@ impl Index {
         }
         let text = String::from_utf8_lossy(&bytes);
         let parsed = parse_blocks(&text);
+        let defs = graph::extract_defs(&path.to_string_lossy(), &text);
 
         // Remove old blocks/postings for this file.
         if let Some(old) = self.files.remove(path) {
@@ -248,6 +267,7 @@ impl Index {
                 mtime,
                 len,
                 blocks: block_ids,
+                defs,
             },
         );
         true
@@ -291,22 +311,27 @@ impl Index {
                     return None;
                 }
                 let text = String::from_utf8_lossy(&bytes);
-                Some((p.clone(), mtime_of(&meta), meta.len(), parse_blocks(&text)))
+                Some(ParsedFile {
+                    path: p.clone(),
+                    mtime: mtime_of(&meta),
+                    len: meta.len(),
+                    blocks: parse_blocks(&text),
+                    defs: graph::extract_defs(&p.to_string_lossy(), &text),
+                })
             })
             .collect();
 
         let n_files = parsed.iter().flatten().count();
-        let n_blocks: usize = parsed.iter().flatten().map(|(_, _, _, b)| b.len()).sum();
+        let n_blocks: usize = parsed.iter().flatten().map(|f| f.blocks.len()).sum();
 
         // Sequential merge: block ids assigned in ascending order -> posting
         // lists come out sorted for free.
-        for item in parsed.into_iter().flatten() {
-            let (path, mtime, len, blocks) = item;
-            self.files.remove(&path); // fresh build; drop any stale entry
+        for file in parsed.into_iter().flatten() {
+            self.files.remove(&file.path); // fresh build; drop any stale entry
             let file_id = self.file_ids.len() as u32;
-            self.file_ids.push(path.to_string_lossy().into_owned());
-            let mut ids = Vec::with_capacity(blocks.len());
-            for pb in blocks {
+            self.file_ids.push(file.path.to_string_lossy().into_owned());
+            let mut ids = Vec::with_capacity(file.blocks.len());
+            for pb in file.blocks {
                 let id = self.blocks.len() as u32;
                 self.blocks.push(Block {
                     file: file_id,
@@ -319,20 +344,28 @@ impl Index {
                 ids.push(id);
             }
             self.files.insert(
-                path,
+                file.path,
                 FileEntry {
                     id: file_id,
-                    mtime,
-                    len,
+                    mtime: file.mtime,
+                    len: file.len,
                     blocks: ids,
+                    defs: file.defs,
                 },
             );
         }
+        let t1 = std::time::Instant::now();
+        let g = graph::rebuild(self);
+        self.graph = g;
         eprintln!(
-            "  parsed {} files / {} blocks in {:.2?} ({} trigram posting lists)",
+            "  parsed {} files / {} blocks in {:?}, graph {} symbols / {} call edges / {} imports in {:?} ({} trigram posting lists)",
             n_files,
             n_blocks,
             t0.elapsed(),
+            self.graph.symbols.len(),
+            self.graph.call_edge_count(),
+            self.graph.file_imports.len(),
+            t1.elapsed(),
             self.postings.len()
         );
     }
@@ -360,7 +393,24 @@ impl Index {
                 changed += 1;
             }
         }
+        if changed > 0 {
+            self.finalize();
+        }
         changed
+    }
+
+    /// Recompute derived state after incremental updates: rebuild the
+    /// knowledge graph (pure in-memory pass) and GC dead embeddings.
+    pub fn finalize(&mut self) {
+        let g = graph::rebuild(self);
+        self.graph = g;
+        let live: HashSet<u64> = self
+            .blocks
+            .iter()
+            .filter(|b| b.file != TOMBSTONE_FILE)
+            .map(|b| crate::embed::fnv64(&b.text))
+            .collect();
+        self.embeddings.gc(&live);
     }
 }
 

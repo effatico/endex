@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-const MAGIC: &[u8; 10] = b"ENDEXIDX\x01\x00";
+const MAGIC: &[u8; 10] = b"ENDEXIDX\x02\x00"; // v2: + graph, + embeddings
 
 pub fn cache_path(root: &Path) -> std::path::PathBuf {
     root.join(".endex-index.bin")

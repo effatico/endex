@@ -5,6 +5,7 @@ use crate::index::{Index, TOMBSTONE_FILE};
 use rayon::prelude::*;
 
 pub struct Hit {
+    pub block_id: u32,
     pub file_id: u32,
     pub line: u32,
     pub text: String,
@@ -87,6 +88,7 @@ fn trigram_search(index: &Index, q: &str) -> Vec<Hit> {
                 None
             } else {
                 Some(Hit {
+                    block_id: bid,
                     file_id: blk.file,
                     line: blk.line,
                     text: blk.text.clone(),
@@ -102,7 +104,8 @@ fn scan_search(index: &Index, q: &str) -> Vec<Hit> {
     index
         .blocks
         .par_iter()
-        .filter_map(|blk| {
+        .enumerate()
+        .filter_map(|(bid, blk)| {
             if blk.file == TOMBSTONE_FILE {
                 return None;
             }
@@ -112,6 +115,7 @@ fn scan_search(index: &Index, q: &str) -> Vec<Hit> {
                 None
             } else {
                 Some(Hit {
+                    block_id: bid as u32,
                     file_id: blk.file,
                     line: blk.line,
                     text: blk.text.clone(),
