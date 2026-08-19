@@ -1,0 +1,30 @@
+[package]
+name = "endex"
+version = "0.1.0"
+edition = "2021"
+description = "Extremely fast, cached, self-updating code indexer with millisecond substring search"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/effatico/endex"
+keywords = ["code-search", "index", "trigram", "search", "dev-tools"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "endex"
+path = "src/lib.rs"
+
+[[bin]]
+name = "endex"
+path = "src/main.rs"
+
+[dependencies]
+rayon = "1"
+ignore = "0.4"
+notify = "6"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
