@@ -79,6 +79,7 @@ pub enum ProviderKind {
     Http,
 }
 
+#[derive(Clone)]
 pub struct Provider {
     pub kind: ProviderKind,
     pub url: String,
@@ -205,7 +206,7 @@ impl Provider {
 
 // ---------- embedding store ----------
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Embeddings {
     /// Provider identity these vectors belong to.
     pub provider_id: String,
@@ -221,16 +222,7 @@ pub fn ensure(
     index: &Index,
     progress: bool,
 ) -> Result<(), String> {
-    if emb.provider_id != prov.id() {
-        *emb = Embeddings {
-            provider_id: prov.id(),
-            dim: match prov.kind {
-                ProviderKind::Hash => prov.dim,
-                ProviderKind::Http => 0,
-            },
-            map: HashMap::new(),
-        };
-    }
+    reset_for_provider(emb, prov);
     let missing: HashMap<u64, String> = index
         .blocks
         .par_iter()
@@ -241,12 +233,40 @@ pub fn ensure(
     if missing.is_empty() {
         return Ok(());
     }
-    let mut items: Vec<(u64, String)> = missing.into_iter().collect();
-    items.sort_unstable_by_key(|(h, _)| *h); // deterministic order
-    let total = items.len();
+    let total = missing.len();
     if progress {
         eprintln!("  embedding {total} block(s) with {} ...", prov.id());
     }
+    embed_texts(emb, prov, missing, progress)
+}
+
+/// Reset the store if the provider changed, so vectors from different
+/// models are never mixed.
+pub fn reset_for_provider(emb: &mut Embeddings, prov: &Provider) {
+    if emb.provider_id != prov.id() {
+        *emb = Embeddings {
+            provider_id: prov.id(),
+            dim: match prov.kind {
+                ProviderKind::Hash => prov.dim,
+                ProviderKind::Http => 0,
+            },
+            map: HashMap::new(),
+        };
+    }
+}
+
+/// Embed a set of (content-hash, text) pairs into the store. This is the
+/// slow HTTP part, deliberately separated so callers can run it without
+/// holding the index lock.
+pub fn embed_texts(
+    emb: &mut Embeddings,
+    prov: &Provider,
+    missing: HashMap<u64, String>,
+    progress: bool,
+) -> Result<(), String> {
+    let mut items: Vec<(u64, String)> = missing.into_iter().collect();
+    items.sort_unstable_by_key(|(h, _)| *h); // deterministic order
+    let total = items.len();
     let mut done = 0usize;
     for chunk in items.chunks(prov.batch.max(1)) {
         let refs: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
@@ -265,6 +285,19 @@ pub fn ensure(
         }
     }
     Ok(())
+}
+
+/// Collect the (hash, text) pairs that still lack vectors, reading the
+/// index. Cheap: a parallel scan; callers should run this under a short
+/// lock, then release the lock before calling `embed_texts`.
+pub fn collect_missing(index: &Index, emb: &Embeddings) -> HashMap<u64, String> {
+    index
+        .blocks
+        .par_iter()
+        .filter(|b| b.file != TOMBSTONE_FILE)
+        .filter(|b| !emb.map.contains_key(&fnv64(&b.text)))
+        .map(|b| (fnv64(&b.text), b.text.clone()))
+        .collect()
 }
 
 /// Ensure all embeddings exist for `idx` (handles the field borrow).
@@ -304,6 +337,11 @@ pub fn top_k(index: &Index, emb: &Embeddings, q: &[f32], k: usize) -> Vec<(f32, 
 
 /// Hybrid search: fuse lexical (trigram) and semantic rankings with
 /// reciprocal rank fusion. Returns hits with their fused score.
+///
+/// NOTE: this embeds every missing block inline before answering — fine for
+/// the CLI where the user expects to wait once, but too slow for latency-
+/// sensitive servers. Those should use `ask_fast` and pre-embed in the
+/// background via `ensure_all`.
 pub fn ask(
     idx: &mut Index,
     prov: &Provider,
@@ -321,6 +359,43 @@ pub fn ask(
     })();
     idx.embeddings = emb;
     result.map(|hits| (hits, idx.embeddings.map.len() != before))
+}
+
+/// Low-latency hybrid search: NEVER embeds the corpus inline. Uses whatever
+/// vectors are already cached (blocks without vectors simply contribute only
+/// to the lexical ranking), so it stays fast even while a background
+/// embedding pass is still warming up. Only the query itself is embedded
+/// (one HTTP round-trip).
+///
+/// Returns `(hits, coverage)` where coverage is the fraction of live blocks
+/// that already have vectors (1.0 = fully warm).
+pub fn ask_fast(
+    idx: &Index,
+    emb: &Embeddings,
+    prov: &Provider,
+    query: &str,
+    limit: usize,
+) -> Result<(Vec<(f32, search::Hit)>, f32), String> {
+    let live = idx
+        .blocks
+        .iter()
+        .filter(|b| b.file != TOMBSTONE_FILE)
+        .count();
+    let covered = idx
+        .blocks
+        .iter()
+        .filter(|b| b.file != TOMBSTONE_FILE)
+        .filter(|b| emb.map.contains_key(&fnv64(&b.text)))
+        .count();
+    let coverage = if live == 0 {
+        1.0
+    } else {
+        covered as f32 / live as f32
+    };
+    let qv = prov.embed(&[query])?.remove(0);
+    let sem = top_k(idx, emb, &qv, 200);
+    let lex = search::search(idx, query, 200);
+    Ok((fuse(idx, &lex, &sem, query, limit), coverage))
 }
 
 fn fuse(

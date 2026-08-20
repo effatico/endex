@@ -57,6 +57,55 @@ endex clues ~/my-repo "rate limiting"
 
 # Watch mode: live updates + interactive REPL
 endex watch ~/my-repo
+
+# MCP server: expose the index to Claude Code / Cursor over stdio
+endex mcp ~/my-repo
+```
+
+## MCP server (AI assistants)
+
+`endex mcp [DIR]` speaks the Model Context Protocol over stdio (newline-delimited JSON-RPC, with `Content-Length` framing auto-detected). Claude Code, Cursor and other MCP clients get seven tools:
+
+| Tool | What it returns |
+|---|---|
+| `endex_index` | Build/refresh the index (incremental) — run once first |
+| `endex_search` | Lexical blocks matching a substring (+ file, line, block text) |
+| `endex_ask` | Hybrid semantic hits (uses the embedding provider env) |
+| `endex_graph` | Symbol neighborhood: kind, file:line, callers, callees, importers |
+| `endex_flow` | Call paths A→B with file:line hops **plus the source block of every hop** (`include_blocks`, default true) — perfect for "how does X reach Y" questions |
+| `endex_clues` | Blocks mentioning a term, annotated with the symbols defined in them |
+| `endex_status` | Index stats (files / blocks / symbols / edges / vectors) |
+
+Every tool accepts an optional `dir` argument; without it, the directory the server was started with is used. The index is loaded once and refreshed incrementally as files change.
+
+### Claude Code setup
+
+```bash
+claude mcp add endex -- /path/to/endex mcp /path/to/your/repo
+# with semantic search against local Ollama:
+claude mcp add endex \
+  -e EMBED_PROVIDER=openai \
+  -e EMBED_URL=http://localhost:11434/v1 \
+  -e EMBED_MODEL=qwen3-embedding \
+  -- /path/to/endex mcp /path/to/your/repo
+```
+
+Or manually in `.mcp.json` / `~/.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "endex": {
+      "command": "/path/to/endex",
+      "args": ["mcp", "/path/to/your/repo"],
+      "env": {
+        "EMBED_PROVIDER": "openai",
+        "EMBED_URL": "http://localhost:11434/v1",
+        "EMBED_MODEL": "qwen3-embedding"
+      }
+    }
+  }
+}
 ```
 
 REPL (watch mode): plain `QUERY` = lexical, `? QUERY` = hybrid semantic, plus `:graph N`, `:flow A B`, `:clues T`, `:embed [provider]`, `:limit N`, `:save`, `:stats`, `:quit`. File changes are reindexed in ~1 ms/file; the graph rebuilds in memory and embeddings update lazily on the next `?` query.
@@ -85,6 +134,7 @@ src/
 ├── embed.rs   embedding providers (hash / OpenAI-compatible HTTP), content-hash vector cache, RRF fusion
 ├── search.rs  posting-list intersection + parallel verification, ranking
 ├── store.rs   atomic bincode cache (versioned magic header, tmp+rename)
+├── mcp.rs     MCP stdio server: JSON-RPC loop + tool handlers (initialize / tools/list / tools/call)
 └── watch.rs   debounced recursive filesystem watcher
 ```
 

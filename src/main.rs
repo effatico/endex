@@ -1,4 +1,4 @@
-use endex::{embed, index::Index, search, store, watch};
+use endex::{embed, index::Index, mcp, search, store, watch};
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -17,6 +17,7 @@ fn main() {
         Some("flow") => cmd_flow(&args[1..]),
         Some("clues") => cmd_clues(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
+        Some("mcp") => cmd_mcp(&args[1..]),
         _ => usage(),
     }
 }
@@ -33,6 +34,8 @@ USAGE:
   endex flow   [DIR] FROM TO      find call-graph paths between two symbols
   endex clues  [DIR] TERM         code blocks mentioning TERM + their symbols
   endex watch  [DIR]              watch for changes + interactive REPL
+  endex mcp    [DIR]              serve the index as an MCP server over stdio
+                                  (Claude Code / Cursor integration)
 
 OPTIONS:
   --limit N            max results (default 50)
@@ -432,6 +435,18 @@ fn cmd_clues(args: &[String]) {
         }
         print_block_matches(&hit.text, hit.line, &term.to_lowercase(), 2);
     }
+}
+
+// ---------- mcp ----------
+
+fn cmd_mcp(args: &[String]) {
+    let opts = parse_opts(args);
+    let root = opts.dir.canonicalize().unwrap_or_else(|_| opts.dir.clone());
+    let root_str = root.to_string_lossy().to_string();
+    // Resolve the embedding provider up front (flags/env) so endex_ask and
+    // the background embedder share the same configuration.
+    let prov = provider_from(&opts);
+    mcp::run(root_str, opts.use_cache, prov);
 }
 
 // ---------- watch ----------
