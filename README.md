@@ -17,7 +17,7 @@ Code is chunked into blank-line-separated **blocks** (max 80 lines), so results 
 | Provider | Flag | Notes |
 |---|---|---|
 | `hash` (default) | `--embed-provider hash` | Deterministic feature-hashing embedding. Fully offline, instant, zero deps. Fuzzy lexical matching (typos, word variants) — not truly semantic. |
-| `openai` | `--embed-provider openai` | Any OpenAI-compatible `/embeddings` endpoint: OpenAI, **Ollama** (`--embed-url http://localhost:11434/v1`), LM Studio, vLLM, ... This is where real semantic search comes from — local *or* remote. |
+| `openai` | `--embed-provider openai` | Any OpenAI-compatible `/embeddings` endpoint: OpenAI, **Ollama** (`--embed-url http://localhost:11434/v1`), **LiteLLM proxy** (`--embed-url http://localhost:4000/v1`), LM Studio, vLLM, ... This is where real semantic search comes from — local *or* remote. |
 | `cohere` | `--embed-provider cohere` | Cohere `/embed` API (`embed-v4.0`, `embed-english-v3.0`, `embed-multilingual-v3.0`). Blocks embed as `search_document`, queries as `search_query` for best retrieval quality. Key via `--embed-key`, `EMBED_API_KEY`, or `COHERE_API_KEY`. |
 
 ```bash
@@ -35,9 +35,71 @@ endex ask ~/my-repo "how do we handle retries" \
   --embed-provider openai \
   --embed-url http://localhost:11434/v1 \
   --embed-model nomic-embed-text
+
+# via a LiteLLM proxy (gateway to OpenAI / Cohere / Ollama / Bedrock / ...)
+endex ask ~/my-repo "how do we handle retries" \
+  --embed-provider openai \
+  --embed-url http://localhost:4000/v1 \
+  --embed-model qwen3-embedding \
+  --embed-key sk-litellm-local
 ```
 
 Env-var equivalents: `EMBED_PROVIDER`, `EMBED_URL`, `EMBED_MODEL`, `EMBED_API_KEY` / `OPENAI_API_KEY` / `COHERE_API_KEY`, `EMBED_DIM`, `EMBED_BATCH`. If the provider is unreachable, `ask` falls back to lexical search with a warning.
+
+### LiteLLM proxy (gateway to any embedding backend)
+
+A [LiteLLM](https://github.com/BerriAI/litellm) proxy exposes an OpenAI-compatible `/v1/embeddings` endpoint, so the `openai` provider works with it unchanged — one gateway for OpenAI, Cohere, Ollama, Bedrock, Azure, Voyage, ... with centralized auth, budgets and fallbacks.
+
+```yaml
+# litellm_config.yaml
+model_list:
+  - model_name: qwen3-embedding            # <- the alias endex uses in EMBED_MODEL
+    litellm_params:
+      model: ollama/qwen3-embedding
+      api_base: http://localhost:11434
+  - model_name: cohere-embed
+    litellm_params:
+      model: cohere/embed-v4.0
+      api_key: os.environ/COHERE_API_KEY
+general_settings:
+  master_key: sk-litellm-local
+```
+
+```bash
+litellm --config litellm_config.yaml --port 4000
+# then: EMBED_PROVIDER=openai EMBED_URL=http://localhost:4000/v1 \
+#         EMBED_MODEL=qwen3-embedding EMBED_API_KEY=sk-litellm-local
+```
+
+Switching `EMBED_MODEL` between LiteLLM aliases is safe: endex's manifest detects the new model identity and re-embeds in the background automatically. One caveat: Cohere's `search_document`/`search_query` asymmetry is only available when connecting to Cohere *directly* (`EMBED_PROVIDER=cohere`), not through the proxy — a minor quality nuance, irrelevant for Ollama/OpenAI models.
+
+## Install
+
+**Prebuilt binaries (no Rust toolchain needed)** — grab one from [GitHub Releases](https://github.com/effatico/endex/releases), or:
+
+```bash
+# macOS / Linux — detects arch, verifies checksum, installs to /usr/local/bin
+curl -fsSL https://raw.githubusercontent.com/effatico/endex/main/install.sh | sh
+
+# Homebrew (macOS/Linux)
+brew install effatico/endex/endex
+
+# Windows: download endex-x86_64-pc-windows-msvc.zip from Releases
+```
+
+**From source** (requires Rust):
+
+```bash
+cargo install --git https://github.com/effatico/endex   # or: cargo build --release
+```
+
+### Cutting a release (maintainers)
+
+```bash
+git tag v0.2.0 && git push --tags
+```
+
+The `Release` workflow builds binaries for Linux (x86_64/aarch64), macOS (Intel/Apple Silicon) and Windows, then attaches them with `.sha256` checksums to a new GitHub Release. After it runs, update the `sha256` values in `Formula/endex.rb`.
 
 ## Usage
 
@@ -75,26 +137,55 @@ endex mcp ~/my-repo
 
 | Tool | What it returns |
 |---|---|
-| `endex_index` | Build/refresh the index (incremental) — run once first |
+| `endex_index` | Build/refresh the index (incremental) — rarely needed, the server self-refreshes |
 | `endex_search` | Lexical blocks matching a substring (+ file, line, block text) |
 | `endex_ask` | Hybrid semantic hits (uses the embedding provider env) |
 | `endex_graph` | Symbol neighborhood: kind, file:line, callers, callees, importers |
 | `endex_flow` | Call paths A→B with file:line hops **plus the source block of every hop** (`include_blocks`, default true) — perfect for "how does X reach Y" questions |
 | `endex_clues` | Blocks mentioning a term, annotated with the symbols defined in them |
-| `endex_status` | Index stats (files / blocks / symbols / edges / vectors) |
+| `endex_status` | Index stats (files / blocks / symbols / edges / vectors / semantic coverage) |
 
-Every tool accepts an optional `dir` argument; without it, the directory the server was started with is used. The index is loaded once and refreshed incrementally as files change.
+Every tool accepts an optional `dir` argument; without it, the directory the server was started with is used.
+
+**Always-on, low-latency by design:** the server holds the index in memory and runs two background threads — a debounced **filesystem watcher** (reindexes changed files in ~1 ms, rebuilds the graph, saves the cache) and a **background embedder** (keeps semantic vectors warm without ever blocking a query). `endex_ask` embeds only the query — never the corpus inline — so it stays fast even while a cold corpus is still embedding; it reports `semantic_coverage` (and `warming_up`) so partial-semantic results are transparent. If the provider is unreachable it degrades to lexical hits with a warning.
+
+**Caching:** vectors are content-hash-keyed and persisted in `.endex-index.bin`; a `.endex-manifest.json` records the provider identity + corpus fingerprint. Restarts reuse all vectors (zero re-embedding), file edits only re-embed the blocks that changed, and a cache written for a different model is detected and rebuilt automatically.
 
 ### Claude Code setup
 
 ```bash
 claude mcp add endex -- /path/to/endex mcp /path/to/your/repo
+
 # with semantic search against local Ollama:
 claude mcp add endex \
   -e EMBED_PROVIDER=openai \
   -e EMBED_URL=http://localhost:11434/v1 \
   -e EMBED_MODEL=qwen3-embedding \
   -- /path/to/endex mcp /path/to/your/repo
+
+# ... against Cohere:
+claude mcp add endex \
+  -e EMBED_PROVIDER=cohere \
+  -e EMBED_MODEL=embed-v4.0 \
+  -e EMBED_API_KEY=$COHERE_API_KEY \
+  -- /path/to/endex mcp /path/to/your/repo
+
+# ... through a LiteLLM proxy:
+claude mcp add endex \
+  -e EMBED_PROVIDER=openai \
+  -e EMBED_URL=http://localhost:4000/v1 \
+  -e EMBED_MODEL=qwen3-embedding \
+  -e EMBED_API_KEY=sk-litellm-local \
+  -- /path/to/endex mcp /path/to/your/repo
+```
+
+**Scopes** (`-s, --scope`): `local` (default — this project only), `project` (`.mcp.json`, committed and shared with the team), `user` (all your projects, in `~/.claude.json`). For user scope, omit the dir argument — the server then indexes whatever project directory Claude Code starts it in:
+
+```bash
+claude mcp add endex -s user \
+  -e EMBED_PROVIDER=openai -e EMBED_URL=http://localhost:11434/v1 \
+  -e EMBED_MODEL=qwen3-embedding \
+  -- /path/to/endex mcp
 ```
 
 Or manually in `.mcp.json` / `~/.claude.json`:
@@ -138,7 +229,7 @@ src/
 ├── main.rs    CLI + interactive watch/REPL loop + hit rendering
 ├── index.rs   trigram index: block parsing, incremental add/remove, parallel build
 ├── graph.rs   knowledge graph: symbol/def extraction, call edges, import resolution, path queries
-├── embed.rs   embedding providers (hash / OpenAI-compatible HTTP), content-hash vector cache, RRF fusion
+├── embed.rs   embedding providers (hash / OpenAI-compatible / Cohere), content-hash vector cache, RRF fusion
 ├── search.rs  posting-list intersection + parallel verification, ranking
 ├── store.rs   atomic bincode cache (versioned magic header, tmp+rename) + JSON manifest (provider id, corpus fingerprint)
 ├── mcp.rs     MCP stdio server: JSON-RPC loop + tool handlers (initialize / tools/list / tools/call)
