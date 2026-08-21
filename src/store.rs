@@ -50,8 +50,7 @@ pub fn manifest_path(root: &Path) -> std::path::PathBuf {
 pub fn save(index: &Index, root: &Path) -> io::Result<()> {
     let path = cache_path(root);
     let t0 = std::time::Instant::now();
-    let mut data =
-        bincode::serialize(index).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut data = bincode::serialize(index).map_err(io::Error::other)?;
     let mut buf = Vec::with_capacity(data.len() + MAGIC.len());
     buf.extend_from_slice(MAGIC);
     buf.append(&mut data);

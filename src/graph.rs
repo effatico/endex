@@ -714,13 +714,12 @@ pub fn rebuild(index: &Index) -> Graph {
                 if blk.file == TOMBSTONE_FILE {
                     continue;
                 }
-                let mut lineno = blk.line;
-                for line in blk.text.lines() {
+                for (i, line) in blk.text.lines().enumerate() {
+                    let lineno = blk.line + i as u32;
                     while di < defs.len() && defs[di].line <= lineno {
                         di += 1;
                     }
                     if di == 0 {
-                        lineno += 1;
                         continue;
                     }
                     let cur = syms[di - 1];
@@ -736,7 +735,6 @@ pub fn rebuild(index: &Index) -> Graph {
                             }
                         }
                     }
-                    lineno += 1;
                 }
             }
             local

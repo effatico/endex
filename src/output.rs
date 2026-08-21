@@ -92,10 +92,8 @@ pub fn print_ask_hits(idx: &Index, hits: &[(f32, search::Hit)], query: &str) {
 pub fn print_block_matches(text: &str, start_line: u32, q: &str, max_lines: usize) {
     let mut stdout = io::stdout().lock();
     let mut shown = 0;
-    let mut lineno = start_line;
-    for line in text.lines() {
+    for (lineno, line) in (start_line..).zip(text.lines()) {
         let l = lineno;
-        lineno += 1;
         let ranges = match_ranges(line, q);
         if ranges.is_empty() {
             continue;
