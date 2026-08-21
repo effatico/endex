@@ -14,6 +14,9 @@ use std::path::Path;
 
 const MAGIC: &[u8; 10] = b"ENDEXIDX\x03\x00"; // v3: + per-file content_hash, manifest
 
+/// Cache format version of the current MAGIC header (bumped on schema change).
+pub const CACHE_VERSION: u32 = 3;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Manifest {
     /// Embedding provider identity (e.g. "http:qwen3-embedding@http://..."),
@@ -74,6 +77,29 @@ pub fn save(index: &Index, root: &Path) -> io::Result<()> {
 /// Read the manifest without touching the big index. Returns None if the
 /// manifest is missing/corrupt — callers should then fall back to a full
 /// load.
+/// Cache file metadata without deserializing the index: path, size,
+/// modified time. Combined with `load_manifest` by callers.
+pub struct CacheInfo {
+    pub path: String,
+    pub bytes: u64,
+    /// seconds since the cache was last written (None if unavailable)
+    pub age_seconds: Option<u64>,
+}
+
+pub fn cache_info(root: &Path) -> Option<CacheInfo> {
+    let path = cache_path(root);
+    let meta = std::fs::metadata(&path).ok()?;
+    let modified = meta.modified().ok();
+    let age = modified
+        .and_then(|m| std::time::SystemTime::now().duration_since(m).ok())
+        .map(|d| d.as_secs());
+    Some(CacheInfo {
+        path: path.to_string_lossy().into_owned(),
+        bytes: meta.len(),
+        age_seconds: age,
+    })
+}
+
 pub fn load_manifest(root: &Path) -> Option<Manifest> {
     let s = fs::read_to_string(manifest_path(root)).ok()?;
     serde_json::from_str(&s).ok()

@@ -52,7 +52,7 @@ export default function (pi: ExtensionAPI) {
     name: "endex_ask",
     label: "endex ask",
     description:
-      "Semantic search over the codebase in NATURAL LANGUAGE — use this whenever you do not know the exact identifier: 'how do we handle retries', 'where is rate limiting enforced', 'authentication middleware'. STRONGLY PREFER this as the FIRST step when exploring an unfamiliar codebase or concept, instead of guessing grep patterns. Each hit includes the full code block text. Combines lexical + embedding similarity (requires an EMBED_* provider configured for the endex server; check endex_status).",
+      "Semantic search over the codebase in NATURAL LANGUAGE — use this whenever you do not know the exact identifier: 'how do we handle retries', 'where is rate limiting enforced', 'authentication middleware'. STRONGLY PREFER this as the FIRST step when exploring an unfamiliar codebase or concept, instead of guessing grep patterns. Each hit includes the full code block text. Combines lexical + embedding similarity (requires an EMBED_* provider configured for the endex server; check endex_stats).",
     promptSnippet: "Natural-language semantic search over the codebase",
     promptGuidelines: [
       "Use endex_ask first when exploring an unfamiliar codebase or concept in natural language, instead of guessing grep patterns.",
@@ -137,19 +137,19 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "endex_status",
-    label: "endex status",
+    name: "endex_stats",
+    label: "endex stats",
     description:
-      "Check the endex index state for a directory: files, blocks, symbols, call edges, embedding vectors and semantic coverage. Call this to verify setup before relying on endex_ask (semantic_coverage < 1 means the background embedder is still warming up).",
-    promptSnippet: "Index stats and semantic coverage",
+      "Check the endex server/index state: files, blocks, symbols, embedding provider + coverage, cache version/age, last index/embed/save timestamps. Call this to verify setup before relying on endex_ask (coverage < 1 means the background embedder is still warming).",
+    promptSnippet: "Server and index stats + semantic coverage",
     parameters: Type.Object({ dir: Dir }),
     async execute(_id, params) {
-      return textResult(await client.callTool("endex_status", params));
+      return textResult(await client.callTool("endex_stats", params));
     },
   });
 
   pi.registerCommand("endex", {
-    description: "endex indexer: /endex status | /endex restart",
+    description: "endex indexer: /endex stats | /endex restart",
     handler: async (args, ctx) => {
       const sub = (args ?? "").trim();
       if (sub === "restart") {
@@ -158,10 +158,10 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       try {
-        const out = await client.callTool("endex_status", {});
+        const out = await client.callTool("endex_stats", {});
         const s = JSON.parse(out);
         ctx.ui.notify(
-          `endex: ${s.files} files · ${s.blocks} blocks · ${s.symbols} symbols · ${s.embedding_vectors} vectors (${Math.round((s.semantic_coverage ?? 0) * 100)}% semantic)`,
+          `endex: ${s.index?.files ?? "?"} files · ${s.index?.blocks ?? "?"} blocks · ${s.index?.symbols ?? "?"} symbols · ${s.embeddings?.vectors ?? "?"} vectors (${Math.round((s.embeddings?.coverage ?? 0) * 100)}% semantic · cache v${s.cache?.version ?? "?"})`,
           "info",
         );
       } catch (e) {

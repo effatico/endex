@@ -15,7 +15,7 @@
 //! are processed without a response.
 
 use crate::embed::{self, Embeddings, Provider};
-use crate::graph::{Graph, SymbolKind};
+use crate::graph::Graph;
 use crate::index::Index;
 use crate::{search, store, watch};
 use serde_json::{json, Value};
@@ -39,6 +39,18 @@ struct Shared {
     idx: Index,
     root: PathBuf,
     dirty: bool,
+    stats: ServerStats,
+}
+
+struct ServerStats {
+    started_unix: u64,
+    indexed_files: usize,
+    last_index_unix: Option<u64>,
+    last_embed_unix: Option<u64>,
+    last_embed_blocks: usize,
+    embed_runs: usize,
+    last_save_unix: Option<u64>,
+    index_runs: usize,
 }
 
 static SHARED: OnceLock<Arc<Mutex<Shared>>> = OnceLock::new();
@@ -62,6 +74,13 @@ static EPOCH: AtomicUsize = AtomicUsize::new(0);
 
 fn change_epoch() -> &'static AtomicUsize {
     &EPOCH
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// All exposed tools, with JSON Schemas for their arguments.
@@ -144,8 +163,8 @@ fn tool_defs() -> Value {
             }
         },
         {
-            "name": "endex_status",
-            "description": "Check whether the endex index is ready for a directory and what it contains (files, blocks, symbols, call edges, embedding vectors, semantic coverage). Call this to verify setup before relying on the other endex_* tools.",
+            "name": "endex_stats",
+            "description": "Server statistics: index size (files/blocks/symbols/edges), embedding provider + coverage, cache version/path/bytes/age, server uptime, last index/embed/save timestamps. Call this to verify setup before relying on endex_ask.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "dir": { "type": "string" } }
@@ -166,6 +185,71 @@ fn rpc_err(id: &Value, code: i64, msg: &str) -> Value {
 
 fn tool_ok(text: String) -> Value {
     json!({ "content": [{ "type": "text", "text": text }] })
+}
+
+/// Build the response meta: wraps the payload with timing + cache info.
+/// Callers construct the payload first, then pass it with the measured
+/// duration. Includes cache version/format, server uptime and — when
+/// available — the embedding provider identity.
+fn meta(sh: &Shared, payload: Value, duration_ms: f64) -> Value {
+    let info = store::cache_info(&sh.root);
+    let mut m = json!({
+        "meta": {
+            "data": payload,
+            "duration_ms": format!("{duration_ms:.2}"),
+            "cache_version": store::CACHE_VERSION,
+        }
+    });
+    if let Some(i) = info {
+        m["meta"]["cache_bytes"] = json!(i.bytes);
+        if let Some(age) = i.age_seconds {
+            m["meta"]["cache_age_seconds"] = json!(age);
+        }
+    }
+    m
+}
+
+/// Full server stats payload for the endex_stats tool.
+fn stats_payload(sh: &Shared, emb: &Embeddings, provider: &Provider) -> Value {
+    let idx = &sh.idx;
+    let s = &sh.stats;
+    let now = unix_now();
+    let info = store::cache_info(&sh.root);
+    json!({
+        "index": {
+            "dir": sh.root,
+            "files": idx.file_count(),
+            "blocks": idx.block_count(),
+            "symbols": idx.graph.symbols.len(),
+            "call_edges": idx.graph.call_edge_count(),
+            "import_edges": idx.graph.file_imports.len(),
+            "corpus_fingerprint": format!("{:#x}", idx.corpus_fingerprint()),
+        },
+        "embeddings": {
+            "provider": provider.id(),
+            "vectors": emb.map.len(),
+            "dim": emb.dim,
+            "coverage": coverage(idx, emb),
+        },
+        "cache": {
+            "version": store::CACHE_VERSION,
+            "path": info.as_ref().map(|i| i.path.clone()),
+            "bytes": info.as_ref().map(|i| i.bytes),
+            "age_seconds": info.as_ref().and_then(|i| i.age_seconds),
+        },
+        "server": {
+            "started_unix": s.started_unix,
+            "uptime_seconds": now.saturating_sub(s.started_unix),
+            "last_index_unix": s.last_index_unix,
+            "indexed_since_start": s.indexed_files,
+            "index_runs": s.index_runs,
+            "last_embed_unix": s.last_embed_unix,
+            "last_embed_blocks": s.last_embed_blocks,
+            "embed_runs": s.embed_runs,
+            "last_save_unix": s.last_save_unix,
+            "revision": env!("CARGO_PKG_VERSION"),
+        },
+    })
 }
 
 fn tool_err(msg: &str) -> Value {
@@ -326,6 +410,7 @@ fn coverage(idx: &Index, emb: &Embeddings) -> f32 {
 }
 
 fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
+    let t0 = std::time::Instant::now();
     match name {
         "endex_index" => {
             let sh_arc = shared();
@@ -334,72 +419,35 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
             let root = sh.root.clone();
             let changed = sh.idx.refresh(&root);
             if changed > 0 {
-                sh.dirty = true;
+                sh.stats.index_runs += 1;
+                sh.stats.last_index_unix = Some(unix_now());
                 change_epoch().fetch_add(1, Ordering::SeqCst);
             }
             let idx = &sh.idx;
             let emb_arc = emb();
             let emb = emb_arc.read().unwrap();
-            tool_ok(
-                json!({
-                    "dir": sh.root,
-                    "refreshed_files": changed,
-                    "files": idx.file_count(),
-                    "blocks": idx.block_count(),
-                    "symbols": idx.graph.symbols.len(),
-                    "call_edges": idx.graph.call_edge_count(),
-                    "import_edges": idx.graph.file_imports.len(),
-                    "semantic_coverage": coverage(idx, &emb),
-                    "message": "index ready (filesystem watcher active; changes are picked up automatically)"
-                })
-                .to_string(),
-            )
+            let payload = json!({
+                "dir": sh.root,
+                "refreshed_files": changed,
+                "files": idx.file_count(),
+                "blocks": idx.block_count(),
+                "symbols": idx.graph.symbols.len(),
+                "call_edges": idx.graph.call_edge_count(),
+                "import_edges": idx.graph.file_imports.len(),
+                "semantic_coverage": coverage(idx, &emb),
+                "message": "index ready (filesystem watcher active; changes are picked up automatically)"
+            });
+            let m = meta(&sh, payload, t0.elapsed().as_secs_f64() * 1000.0);
+            tool_ok(m.to_string())
         }
 
-        "endex_status" => {
+        "endex_stats" => {
             let sh_arc = shared();
             let sh = sh_arc.lock().unwrap();
             let emb_store = emb();
             let emb = emb_store.read().unwrap();
-            let idx = &sh.idx;
-            let g = &idx.graph;
-            let kind_counts: Value = {
-                let mut m = serde_json::Map::new();
-                for k in [
-                    SymbolKind::Func,
-                    SymbolKind::Method,
-                    SymbolKind::Class,
-                    SymbolKind::Struct,
-                    SymbolKind::Enum,
-                    SymbolKind::Trait,
-                    SymbolKind::Type,
-                    SymbolKind::Interface,
-                    SymbolKind::Impl,
-                ] {
-                    let n = g.symbols.iter().filter(|s| s.kind == k).count();
-                    if n > 0 {
-                        m.insert(k.label().to_string(), Value::from(n));
-                    }
-                }
-                Value::Object(m)
-            };
-            tool_ok(
-                json!({
-                    "dir": sh.root,
-                    "files": idx.file_count(),
-                    "blocks": idx.block_count(),
-                    "symbols": g.symbols.len(),
-                    "symbol_kinds": kind_counts,
-                    "call_edges": g.call_edge_count(),
-                    "import_edges": g.file_imports.len(),
-                    "embedding_vectors": emb.map.len(),
-                    "embedding_dim": emb.dim,
-                    "embedding_provider": provider.id(),
-                    "semantic_coverage": coverage(idx, &emb),
-                    "corpus_fingerprint": format!("{:#x}", idx.corpus_fingerprint()),
-                })
-                .to_string(),
-            )
+            let payload = stats_payload(&sh, &emb, provider);
+            tool_ok(payload.to_string())
         }
 
         "endex_search" => {
@@ -423,7 +471,9 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
                     })
                 })
                 .collect();
-            tool_ok(json!({ "query": query, "count": hits.len(), "hits": out }).to_string())
+            let payload = json!({ "query": query, "count": hits.len(), "hits": out });
+            let m = meta(&sh, payload, t0.elapsed().as_secs_f64() * 1000.0);
+            tool_ok(m.to_string())
         }
 
         "endex_ask" => {
@@ -452,17 +502,16 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
                             })
                         })
                         .collect();
-                    tool_ok(
-                        json!({
-                            "query": query,
-                            "provider": provider.id(),
-                            "semantic_coverage": cov,
-                            "warming_up": cov < 0.95,
-                            "count": hits.len(),
-                            "hits": out
-                        })
-                        .to_string(),
-                    )
+                    let payload = json!({
+                        "query": query,
+                        "provider": provider.id(),
+                        "semantic_coverage": cov,
+                        "warming_up": cov < 0.95,
+                        "count": hits.len(),
+                        "hits": out
+                    });
+                    let m = meta(&sh, payload, t0.elapsed().as_secs_f64() * 1000.0);
+                    tool_ok(m.to_string())
                 }
                 Err(e) => {
                     // Provider unreachable: degrade to lexical, say so.
@@ -478,16 +527,15 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
                             })
                         })
                         .collect();
-                    tool_ok(
-                        json!({
-                            "query": query,
-                            "warning": format!("semantic provider unavailable ({e}); results are lexical only"),
-                            "semantic_coverage": 0.0,
-                            "count": hits.len(),
-                            "hits": out
-                        })
-                        .to_string(),
-                    )
+                    let payload = json!({
+                        "query": query,
+                        "warning": format!("semantic provider unavailable ({e}); results are lexical only"),
+                        "semantic_coverage": 0.0,
+                        "count": hits.len(),
+                        "hits": out
+                    });
+                    let m = meta(&sh, payload, t0.elapsed().as_secs_f64() * 1000.0);
+                    tool_ok(m.to_string())
                 }
             }
         }
@@ -514,7 +562,9 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
                 ));
             }
             let out: Vec<Value> = ids.iter().map(|&id| symbol_summary(idx, g, id)).collect();
-            tool_ok(json!({ "symbol": sym, "matches": out }).to_string())
+            let payload = json!({ "symbol": sym, "matches": out });
+            let m = meta(&sh, payload, t0.elapsed().as_secs_f64() * 1000.0);
+            tool_ok(m.to_string())
         }
 
         "endex_clues" => {
@@ -569,7 +619,9 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
                     })
                 })
                 .collect();
-            tool_ok(json!({ "term": term, "count": hits.len(), "hits": out }).to_string())
+            let payload = json!({ "term": term, "count": hits.len(), "hits": out });
+            let m = meta(&sh, payload, t0.elapsed().as_secs_f64() * 1000.0);
+            tool_ok(m.to_string())
         }
 
         "endex_flow" => {
@@ -613,15 +665,14 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
             }
             let paths = g.find_paths(&sources, &targets, max_depth, 5);
             if paths.is_empty() {
-                return tool_ok(
-                    json!({
-                        "from": from,
-                        "to": to,
-                        "paths": [],
-                        "message": format!("no call path found (max depth {max_depth})")
-                    })
-                    .to_string(),
-                );
+                let payload = json!({
+                    "from": from,
+                    "to": to,
+                    "paths": [],
+                    "message": format!("no call path found (max depth {max_depth})")
+                });
+                let m = meta(&sh, payload, t0.elapsed().as_secs_f64() * 1000.0);
+                return tool_ok(m.to_string());
             }
             let out: Vec<Value> = paths
                 .iter()
@@ -647,18 +698,20 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
                     json!({ "hops": hops })
                 })
                 .collect();
-            tool_ok(
-                json!({
-                    "from": from,
-                    "to": to,
-                    "path_count": paths.len(),
-                    "paths": out
-                })
-                .to_string(),
-            )
+            let payload = json!({
+                "from": from,
+                "to": to,
+                "path_count": paths.len(),
+                "paths": out
+            });
+            let m = meta(&sh, payload, t0.elapsed().as_secs_f64() * 1000.0);
+            tool_ok(m.to_string())
         }
 
-        _ => tool_err(&format!("unknown tool: {name}")),
+        _ => {
+            let _ = t0; // silence unused for dispatch fallthrough
+            tool_err(&format!("unknown tool: {name}"))
+        }
     }
 }
 
@@ -699,9 +752,15 @@ fn spawn_watcher() {
             }
             if n > 0 {
                 sh.idx.finalize(); // rebuild graph + GC embeddings in memory
+                let now = unix_now();
+                sh.stats.indexed_files += n;
+                sh.stats.index_runs += 1;
+                sh.stats.last_index_unix = Some(now);
                 sh.dirty = true;
                 let root = sh.root.clone();
-                let _ = store::save(&sh.idx, &root);
+                if store::save(&sh.idx, &root).is_ok() {
+                    sh.stats.last_save_unix = Some(now);
+                }
                 sh.dirty = false;
                 change_epoch().fetch_add(1, Ordering::SeqCst);
                 eprintln!("endex MCP: reindexed {n} changed file(s)");
@@ -838,6 +897,16 @@ pub fn run(dir: String, use_cache: bool, provider: Provider) {
         root: root.clone(),
         idx,
         dirty: false,
+        stats: ServerStats {
+            started_unix: unix_now(),
+            indexed_files: changed,
+            last_index_unix: None,
+            last_embed_unix: None,
+            last_embed_blocks: 0,
+            embed_runs: 0,
+            last_save_unix: None,
+            index_runs: usize::from(changed > 0),
+        },
     }));
     if SHARED.set(shared_state).is_err() {
         panic!("shared state installed exactly once");
