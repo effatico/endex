@@ -1,0 +1,16 @@
+{
+  "name": "endex",
+  "version": "0.1.0",
+  "description": "Fast cached code indexer with millisecond search, knowledge graph, hybrid semantic search, and an MCP server for AI coding assistants",
+  "type": "module",
+  "license": "MIT",
+  "repository": "https://github.com/effatico/endex",
+  "keywords": ["pi-package", "code-search", "mcp", "indexer", "semantic-search"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/index.ts"]
+  }
+}
