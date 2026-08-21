@@ -8,15 +8,19 @@ const client = new EndexMcpClient({
   onLog: (l) => console.error("  [server]", l),
 });
 
-const status = JSON.parse(await client.callTool("endex_status", {}));
-console.log("status:", status.files, "files,", status.symbols, "symbols");
+// Tool payloads arrive wrapped in the meta envelope: { meta: { data, ... } }.
+const unwrap = async (name, args) => {
+  const raw = JSON.parse(await client.callTool(name, args));
+  return raw.meta?.data ?? raw;
+};
 
-const flow = JSON.parse(
-  await client.callTool("endex_flow", { from: "main", to: "save", include_blocks: false }),
-);
+const stats = await unwrap("endex_stats", {});
+console.log("stats:", stats.index.files, "files,", stats.index.symbols, "symbols");
+
+const flow = await unwrap("endex_flow", { from: "main", to: "save", include_blocks: false });
 console.log("flow main->save:", flow.path_count, "path(s)");
 
-const search = JSON.parse(await client.callTool("endex_search", { query: "trigram", limit: 2 }));
+const search = await unwrap("endex_search", { query: "trigram", limit: 2 });
 console.log("search 'trigram':", search.count, "hits, first:", search.hits[0]?.file);
 
 client.dispose();

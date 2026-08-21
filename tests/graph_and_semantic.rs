@@ -45,7 +45,11 @@ impl Drop for TempDir {
 }
 
 fn hash_provider() -> embed::Provider {
-    embed::Provider::resolve(Some("hash"), None, None, None, Some(256), None)
+    embed::Provider::resolve(&embed::ProviderOpts {
+        provider: Some("hash".into()),
+        dim: Some(256),
+        ..Default::default()
+    })
 }
 
 // ---------- graph ----------
@@ -162,6 +166,49 @@ fn graph_updates_incrementally() {
     assert!(idx.graph.find_all("target").is_empty());
 }
 
+#[test]
+fn graph_prefers_same_file_definitions_for_common_names() {
+    let tmp = TempDir::new();
+    tmp.write(
+        "a.ts",
+        "function save(x: number) { return x; }\n\nfunction mainA() {\n  save(1);\n}\n",
+    );
+    tmp.write(
+        "b.ts",
+        "function save(x: number) { return x; }\n\nfunction mainB() {\n  save(2);\n}\n",
+    );
+    let mut idx = Index::new(tmp.path());
+    idx.build(tmp.path());
+    let g = &idx.graph;
+
+    // `save` is defined in both files; each caller must link to the LOCAL
+    // definition only, not to every same-named symbol in the repo.
+    let saves = g.find_all("save");
+    assert_eq!(saves.len(), 2);
+    let save_a = saves
+        .iter()
+        .find(|&&id| idx.path_of(g.symbols[id as usize].file).ends_with("a.ts"))
+        .copied()
+        .unwrap();
+    let save_b = saves
+        .iter()
+        .find(|&&id| idx.path_of(g.symbols[id as usize].file).ends_with("b.ts"))
+        .copied()
+        .unwrap();
+    let caller_names_a: Vec<&str> = g
+        .callers(save_a)
+        .iter()
+        .map(|&c| g.symbols[c as usize].name.as_str())
+        .collect();
+    let caller_names_b: Vec<&str> = g
+        .callers(save_b)
+        .iter()
+        .map(|&c| g.symbols[c as usize].name.as_str())
+        .collect();
+    assert_eq!(caller_names_a, vec!["mainA"]);
+    assert_eq!(caller_names_b, vec!["mainB"]);
+}
+
 // ---------- embeddings ----------
 
 #[test]
@@ -234,12 +281,20 @@ fn provider_switch_invalidates_embeddings() {
     let mut idx = Index::new(tmp.path());
     idx.build(tmp.path());
 
-    let p256 = embed::Provider::resolve(Some("hash"), None, None, None, Some(256), None);
+    let p256 = embed::Provider::resolve(&embed::ProviderOpts {
+        provider: Some("hash".into()),
+        dim: Some(256),
+        ..Default::default()
+    });
     embed::ensure_all(&mut idx, &p256).unwrap();
     assert_eq!(idx.embeddings.map.len(), 1);
 
     // Different dim -> different provider id -> embeddings reset.
-    let p128 = embed::Provider::resolve(Some("hash"), None, None, None, Some(128), None);
+    let p128 = embed::Provider::resolve(&embed::ProviderOpts {
+        provider: Some("hash".into()),
+        dim: Some(128),
+        ..Default::default()
+    });
     embed::ensure_all(&mut idx, &p128).unwrap();
     assert_eq!(idx.embeddings.provider_id, p128.id());
     assert_eq!(idx.embeddings.map.len(), 1);

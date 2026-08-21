@@ -12,10 +12,19 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-const MAGIC: &[u8; 10] = b"ENDEXIDX\x03\x00"; // v3: + per-file content_hash, manifest
+const MAGIC: &[u8; 10] = b"ENDEXIDX\x04\x00"; // v4: + per-block content hash
 
 /// Cache format version of the current MAGIC header (bumped on schema change).
-pub const CACHE_VERSION: u32 = 3;
+pub const CACHE_VERSION: u32 = 4;
+
+/// Files the tool itself writes into the indexed directory. Watchers and
+/// walkers must ignore them or the index re-ingests its own output forever.
+pub const SELF_WRITTEN: &[&str] = &[
+    ".endex-index.bin",
+    ".endex-index.tmp",
+    ".endex-manifest.json",
+    ".endex-manifest.tmp",
+];
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Manifest {

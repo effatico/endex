@@ -1,11 +1,9 @@
-use endex::{embed, index::Index, mcp, search, store, watch};
+use endex::{embed, index::Index, mcp, output, search, store, watch};
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
-
-const CACHE_FILENAME: &str = ".endex-index.bin";
+use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -18,11 +16,13 @@ fn main() {
         Some("clues") => cmd_clues(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
         Some("mcp") => cmd_mcp(&args[1..]),
-        _ => usage(),
+        Some("--version") | Some("-V") => println!("endex {}", env!("CARGO_PKG_VERSION")),
+        Some("--help") | Some("-h") => usage(0),
+        _ => usage(2),
     }
 }
 
-fn usage() -> ! {
+fn usage(code: i32) -> ! {
     eprintln!(
         "endex — fast cached code indexer: trigram search + knowledge graph + hybrid semantic search
 
@@ -55,9 +55,11 @@ REPL (watch mode):
   :clues TERM      blocks + symbols        :embed    build/refresh embeddings
   :limit N  :save  :stats  :quit
 
-The cache is stored as {CACHE_FILENAME} inside the indexed directory."
+The cache is stored as .endex-index.bin (plus .endex-manifest.json) inside
+  the indexed directory. The watcher and full walks always honor .gitignore;
+  hidden (dot) files and the cache files themselves are never indexed."
     );
-    std::process::exit(2);
+    std::process::exit(code);
 }
 
 // ---------- arg parsing ----------
@@ -67,17 +69,7 @@ struct Opts {
     terms: Vec<String>,
     limit: usize,
     use_cache: bool,
-    embed: EmbedOpts,
-}
-
-#[derive(Default)]
-struct EmbedOpts {
-    provider: Option<String>,
-    model: Option<String>,
-    url: Option<String>,
-    key: Option<String>,
-    dim: Option<usize>,
-    batch: Option<usize>,
+    embed: embed::ProviderOpts,
 }
 
 fn parse_opts(args: &[String]) -> Opts {
@@ -86,7 +78,7 @@ fn parse_opts(args: &[String]) -> Opts {
         terms: Vec::new(),
         limit: 50,
         use_cache: true,
-        embed: EmbedOpts::default(),
+        embed: embed::ProviderOpts::default(),
     };
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
@@ -120,14 +112,7 @@ fn parse_opts(args: &[String]) -> Opts {
 }
 
 fn provider_from(opts: &Opts) -> embed::Provider {
-    embed::Provider::resolve(
-        opts.embed.provider.as_deref(),
-        opts.embed.model.as_deref(),
-        opts.embed.url.as_deref(),
-        opts.embed.key.as_deref(),
-        opts.embed.dim,
-        opts.embed.batch,
-    )
+    embed::Provider::resolve(&opts.embed)
 }
 
 // ---------- load-or-build ----------
@@ -208,7 +193,7 @@ fn cmd_search(args: &[String]) {
     let idx = load_or_build(&root, opts.use_cache);
     let t = Instant::now();
     let hits = search::search(&idx, &query, opts.limit);
-    print_hits(&idx, &hits, &query, opts.limit, t.elapsed());
+    output::print_hits(&idx, &hits, &query, opts.limit, t.elapsed());
 }
 
 fn cmd_ask(args: &[String]) {
@@ -231,7 +216,7 @@ fn cmd_ask(args: &[String]) {
                 dt,
                 prov.id()
             );
-            print_ask_hits(&idx, &hits, &query);
+            output::print_ask_hits(&idx, &hits, &query);
             if changed {
                 let _ = store::save(&idx, &root);
             }
@@ -239,7 +224,7 @@ fn cmd_ask(args: &[String]) {
         Err(e) => {
             eprintln!("warning: semantic search unavailable ({e}); falling back to lexical");
             let hits = search::search(&idx, &query, opts.limit);
-            print_hits(&idx, &hits, &query, opts.limit, t.elapsed());
+            output::print_hits(&idx, &hits, &query, opts.limit, t.elapsed());
         }
     }
 }
@@ -434,7 +419,7 @@ fn cmd_clues(args: &[String]) {
                 );
             }
         }
-        print_block_matches(&hit.text, hit.line, &term.to_lowercase(), 2);
+        output::print_block_matches(&hit.text, hit.line, &term.to_lowercase(), 2);
     }
 }
 
@@ -503,6 +488,7 @@ fn cmd_watch(args: &[String]) {
     let mut dirty = false;
     let mut limit = opts.limit;
     let mut prov = provider_from(&opts);
+    let mut ignores = watch::Ignores::new(&root);
     println!(
         "Type a query and press Enter. Prefix with ? for hybrid semantic search ({}).
 Commands: :graph N  :flow A B  :clues T  :embed [provider]  :limit N  :save  :stats  :quit",
@@ -534,8 +520,10 @@ Commands: :graph N  :flow A B  :clues T  :embed [provider]  :limit N  :save  :st
                     _ if line == ":embed" || line.starts_with(":embed ") => {
                         if let Some(p) = line.strip_prefix(":embed").map(str::trim) {
                             if !p.is_empty() {
-                                prov =
-                                    embed::Provider::resolve(Some(p), None, None, None, None, None);
+                                prov = embed::Provider::resolve(&embed::ProviderOpts {
+                                    provider: Some(p.to_string()),
+                                    ..Default::default()
+                                });
                             }
                         }
                         match embed::ensure_all(&mut idx, &prov) {
@@ -644,12 +632,12 @@ Commands: :graph N  :flow A B  :clues T  :embed [provider]  :limit N  :save  :st
                                         t.elapsed(),
                                         prov.id()
                                     );
-                                    print_ask_hits(&idx, &hits, &q);
+                                    output::print_ask_hits(&idx, &hits, &q);
                                 }
                                 Err(e) => {
                                     eprintln!("semantic search failed: {e}");
                                     let hits = search::search(&idx, &q, limit);
-                                    print_hits(&idx, &hits, &q, limit, t.elapsed());
+                                    output::print_hits(&idx, &hits, &q, limit, t.elapsed());
                                 }
                             }
                         }
@@ -657,7 +645,7 @@ Commands: :graph N  :flow A B  :clues T  :embed [provider]  :limit N  :save  :st
                     _ => {
                         let t = Instant::now();
                         let hits = search::search(&idx, &line, limit);
-                        print_hits(&idx, &hits, &line, limit, t.elapsed());
+                        output::print_hits(&idx, &hits, &line, limit, t.elapsed());
                     }
                 }
                 print!("search> ");
@@ -666,13 +654,14 @@ Commands: :graph N  :flow A B  :clues T  :embed [provider]  :limit N  :save  :st
             Ok(Msg::Changed(paths)) => {
                 let mut n = 0usize;
                 for p in &paths {
-                    if !p.is_file() {
-                        idx.remove_file(p);
+                    // Same ignore rules as full walks — otherwise gitignored
+                    // secrets (.env) and build output would leak into the
+                    // index through watcher events.
+                    if ignores.is_ignored(p, p.is_dir()) {
                         continue;
                     }
-                    if p.file_name().map(|f| f == CACHE_FILENAME).unwrap_or(false)
-                        || p.components().any(|c| c.as_os_str() == ".git")
-                    {
+                    if !p.is_file() {
+                        idx.remove_file(p);
                         continue;
                     }
                     if idx.index_file(p) {
@@ -696,72 +685,4 @@ Commands: :graph N  :flow A B  :clues T  :embed [provider]  :limit N  :save  :st
         let _ = store::save(&idx, &root);
     }
     println!("Bye.");
-}
-
-// ---------- output ----------
-
-fn print_hits(idx: &Index, hits: &[search::Hit], query: &str, limit: usize, search_time: Duration) {
-    let q = query.to_lowercase();
-    let total = hits.len();
-    println!(
-        "\x1b[1m{total}\x1b[0m block(s) matched in \x1b[1m{:.2?}\x1b[0m{}",
-        search_time,
-        if total == limit {
-            format!(" (showing top {limit})")
-        } else {
-            String::new()
-        }
-    );
-
-    let mut stdout = io::stdout().lock();
-    let _ = stdout.flush();
-    drop(stdout);
-    for hit in hits {
-        println!("\x1b[1;36m{}:{}\x1b[0m", idx.path_of(hit.file_id), hit.line);
-        print_block_matches(&hit.text, hit.line, &q, 6);
-    }
-}
-
-fn print_ask_hits(idx: &Index, hits: &[(f32, search::Hit)], query: &str) {
-    let q = query.to_lowercase();
-    for (score, hit) in hits {
-        println!(
-            "\x1b[1;36m{}:{}\x1b[0m  \x1b[2mscore {score:.4}\x1b[0m",
-            idx.path_of(hit.file_id),
-            hit.line
-        );
-        print_block_matches(&hit.text, hit.line, &q, 4);
-    }
-}
-
-/// Print the matching lines of a block with line numbers and highlights.
-fn print_block_matches(text: &str, start_line: u32, q: &str, max_lines: usize) {
-    let mut stdout = io::stdout().lock();
-    let mut shown = 0;
-    let mut lineno = start_line;
-    for line in text.lines() {
-        let l = lineno;
-        lineno += 1;
-        if !line.to_lowercase().contains(q) {
-            continue;
-        }
-        if shown == max_lines {
-            let _ = writeln!(stdout, "\x1b[2m  ··· (more matches in this block)\x1b[0m");
-            break;
-        }
-        let _ = writeln!(stdout);
-        let _ = write!(stdout, "  \x1b[2m{l:>5}|\x1b[0m ");
-        let lower = line.to_lowercase();
-        let mut start = 0usize;
-        while let Some(pos) = lower[start..].find(q) {
-            let abs = start + pos;
-            let _ = write!(stdout, "{}", &line[start..abs]);
-            let end = (abs + q.len()).min(line.len());
-            let _ = write!(stdout, "\x1b[1;31m{}\x1b[0m", &line[abs..end]);
-            start = end.max(abs + 1);
-        }
-        let _ = writeln!(stdout, "{}", &line[start..]);
-        shown += 1;
-    }
-    let _ = stdout.flush();
 }

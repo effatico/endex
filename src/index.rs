@@ -31,9 +31,9 @@ pub struct FileEntry {
     /// definitions extracted at index time (sorted by line)
     #[serde(default)]
     pub defs: Vec<Def>,
-    /// content hash (fnv64 of the file's text) — explicit invalidation key.
-    /// Two files with identical content share it; a file whose content
-    /// changed gets a new hash even if mtime/len happen to match.
+    /// content hash (fnv64 of the file's text). Used for the corpus
+    /// fingerprint in the cache manifest — a cheap staleness canary.
+    /// Change *detection* for reindexing is mtime+len based (above).
     #[serde(default)]
     pub content_hash: u64,
 }
@@ -43,6 +43,11 @@ pub struct Block {
     pub file: u32,
     pub line: u32, // 1-based line of block start
     pub text: String,
+    /// fnv64 of `text`, computed once at parse time. Embedding lookups,
+    /// coverage checks and GC all key off this — recomputing it per query
+    /// costs a full corpus hash pass on every call.
+    #[serde(default)]
+    pub hash: u64,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -69,6 +74,7 @@ struct ParsedBlock {
     line: u32,
     text: String,
     trigrams: Vec<u32>,
+    hash: u64,
 }
 
 struct ParsedFile {
@@ -92,10 +98,12 @@ fn parse_blocks(text: &str) -> Vec<ParsedBlock> {
         }
         let text = cur.join("\n");
         let trigrams = block_trigrams(&text);
+        let hash = crate::embed::fnv64(&text);
         blocks.push(ParsedBlock {
             line: start_line,
             text,
             trigrams,
+            hash,
         });
         cur.clear();
     }
@@ -169,21 +177,20 @@ impl Index {
             .unwrap_or("")
     }
 
-    fn remove_block_postings(&mut self, block_id: u32) {
-        if let Some(blk) = self.blocks.get(block_id as usize) {
-            if blk.file == TOMBSTONE_FILE {
-                return;
-            }
-            let tris = block_trigrams(&blk.text);
-            for t in tris {
-                if let Some(v) = self.postings.get_mut(&t) {
-                    v.retain(|&b| b != block_id);
-                    if v.is_empty() {
-                        self.postings.remove(&t);
-                    }
-                }
-            }
-        }
+    /// Tombstone a block: the slot is recycled via `free_blocks`. Its stale
+    /// posting-list entries are deliberately NOT removed — query-time
+    /// verification checks the block's current text anyway, and ids are
+    /// recycled, so stale entries are transient and correctness never
+    /// depends on their removal. This turns a reindex from
+    /// O(trigrams x posting-list-length) into O(trigrams).
+    fn tombstone_block(&mut self, block_id: u32) {
+        self.blocks[block_id as usize] = Block {
+            file: TOMBSTONE_FILE,
+            line: 0,
+            text: String::new(),
+            hash: 0,
+        };
+        self.free_blocks.push(block_id);
     }
 
     fn alloc_block_id(&mut self) -> u32 {
@@ -192,6 +199,7 @@ impl Index {
                 file: TOMBSTONE_FILE,
                 line: 0,
                 text: String::new(),
+                hash: 0,
             });
             (self.blocks.len() - 1) as u32
         })
@@ -228,16 +236,10 @@ impl Index {
         let parsed = parse_blocks(&text);
         let defs = graph::extract_defs(&path.to_string_lossy(), &text);
 
-        // Remove old blocks/postings for this file.
+        // Remove old blocks for this file (tombstone only — see above).
         if let Some(old) = self.files.remove(path) {
             for &b in &old.blocks {
-                self.remove_block_postings(b);
-                self.blocks[b as usize] = Block {
-                    file: TOMBSTONE_FILE,
-                    line: 0,
-                    text: String::new(),
-                };
-                self.free_blocks.push(b);
+                self.tombstone_block(b);
             }
             self.file_ids[old.id as usize] = String::new();
             self.free_files.push(old.id);
@@ -257,9 +259,12 @@ impl Index {
                 file: file_id,
                 line: pb.line,
                 text: pb.text,
+                hash: pb.hash,
             };
             for t in pb.trigrams {
                 let v = self.postings.entry(t).or_default();
+                // Guard against duplicates: recycled block ids may already
+                // have a stale entry for this trigram.
                 match v.binary_search(&id) {
                     Ok(_) => {}
                     Err(pos) => v.insert(pos, id),
@@ -285,13 +290,7 @@ impl Index {
     pub fn remove_file(&mut self, path: &Path) -> bool {
         if let Some(old) = self.files.remove(path) {
             for &b in &old.blocks {
-                self.remove_block_postings(b);
-                self.blocks[b as usize] = Block {
-                    file: TOMBSTONE_FILE,
-                    line: 0,
-                    text: String::new(),
-                };
-                self.free_blocks.push(b);
+                self.tombstone_block(b);
             }
             self.file_ids[old.id as usize] = String::new();
             self.free_files.push(old.id);
@@ -303,7 +302,7 @@ impl Index {
 
     /// Full parallel build over a directory tree (respecting .gitignore etc).
     pub fn build(&mut self, root: &Path) {
-        self.root = root.to_path_buf();
+        *self = Index::new(root); // full rebuild: drop any stale state
         let paths: Vec<PathBuf> = walk_files(root);
 
         let t0 = std::time::Instant::now();
@@ -346,6 +345,7 @@ impl Index {
                     file: file_id,
                     line: pb.line,
                     text: pb.text,
+                    hash: pb.hash,
                 });
                 for t in pb.trigrams {
                     self.postings.entry(t).or_default().push(id);
@@ -418,7 +418,7 @@ impl Index {
             .blocks
             .iter()
             .filter(|b| b.file != TOMBSTONE_FILE)
-            .map(|b| crate::embed::fnv64(&b.text))
+            .map(|b| b.hash)
             .collect();
         self.embeddings.gc(&live);
     }
@@ -434,22 +434,6 @@ impl Index {
         }
         h
     }
-
-    /// Files whose content hash differs from `other` (or that are new) —
-    /// i.e. the unit of a partial cache update.
-    pub fn changed_files_vs(&self, other: &Index) -> Vec<PathBuf> {
-        self.files
-            .iter()
-            .filter(|(p, e)| {
-                other
-                    .files
-                    .get(*p)
-                    .map(|o| o.content_hash != e.content_hash)
-                    .unwrap_or(true)
-            })
-            .map(|(p, _)| p.clone())
-            .collect()
-    }
 }
 
 /// Collect indexable files using the `ignore` walker (gitignore-aware,
@@ -464,6 +448,12 @@ pub fn walk_files(root: &Path) -> Vec<PathBuf> {
         .git_exclude(true)
         .parents(true)
         .follow_links(false)
+        // Never index our own cache/manifest files, even in repos that
+        // don't gitignore them.
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !crate::store::SELF_WRITTEN.contains(&name.as_ref())
+        })
         .build()
         .flatten()
     {

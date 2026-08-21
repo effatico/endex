@@ -22,17 +22,24 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
-/// Files the server itself writes — the watcher must ignore them or it
-/// reindexes its own output forever.
-const SELF_WRITTEN: &[&str] = &[
-    ".endex-index.bin",
-    ".endex-index.tmp",
-    ".endex-manifest.json",
-    ".endex-manifest.tmp",
-];
+
+/// Locks that survive a poisoned mutex: after `panic = "abort"` was dropped
+/// from the release profile, a panicking tool call must not take down every
+/// subsequent request with it.
+fn mlock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn rlock<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn wlock<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Global state shared by all tool calls and the background tasks.
 struct Shared {
@@ -83,17 +90,17 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// All exposed tools, with JSON Schemas for their arguments.
+/// All exposed tools, with JSON Schemas for their arguments. Tools always
+/// operate on the directory the server was started with (a deliberately
+/// single-root design — one server per repo).
 fn tool_defs() -> Value {
     json!([
         {
             "name": "endex_index",
-            "description": "Build or refresh the endex code index for a directory. IMPORTANT: call this FIRST when starting work in a repo where endex has not been run yet — it enables all other endex_* tools (subsequent calls are incremental, only changed files are re-parsed, and the other tools auto-load the index anyway). Skip it if endex_status already returns stats for this directory.",
+            "description": "Build or refresh the endex code index. IMPORTANT: call this FIRST when starting work in a repo where endex has not been run yet — it enables all other endex_* tools (subsequent calls are incremental, only changed files are re-parsed, and the other tools auto-load the index anyway). Skip it if endex_stats already returns stats for this directory.",
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "dir": { "type": "string", "description": "Directory to index (absolute or relative). Default: the directory the server was started with." }
-                }
+                "properties": {}
             }
         },
         {
@@ -103,7 +110,6 @@ fn tool_defs() -> Value {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Case-insensitive substring to find — e.g. a function name, type name, log message, or error string." },
-                    "dir": { "type": "string" },
                     "limit": { "type": "integer", "description": "Max results (default 20, max 100)." }
                 },
                 "required": ["query"]
@@ -116,7 +122,6 @@ fn tool_defs() -> Value {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Natural language question or description of the code you are looking for." },
-                    "dir": { "type": "string" },
                     "limit": { "type": "integer" }
                 },
                 "required": ["query"]
@@ -128,8 +133,7 @@ fn tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "symbol": { "type": "string", "description": "Symbol name (function, method, class, struct, ...)." },
-                    "dir": { "type": "string" }
+                    "symbol": { "type": "string", "description": "Symbol name (function, method, class, struct, ...)." }
                 },
                 "required": ["symbol"]
             }
@@ -142,7 +146,6 @@ fn tool_defs() -> Value {
                 "properties": {
                     "from": { "type": "string", "description": "Source symbol name — an entry point like main, a handler, an exported API." },
                     "to": { "type": "string", "description": "Target symbol name — the downstream function you want to trace into." },
-                    "dir": { "type": "string" },
                     "include_blocks": { "type": "boolean", "description": "Also include the source text of the block each hop is defined in (default true — keep it on unless the response is too large)." },
                     "max_depth": { "type": "integer", "description": "Max path length (default 8)." }
                 },
@@ -156,7 +159,6 @@ fn tool_defs() -> Value {
                 "type": "object",
                 "properties": {
                     "term": { "type": "string" },
-                    "dir": { "type": "string" },
                     "limit": { "type": "integer" }
                 },
                 "required": ["term"]
@@ -167,7 +169,7 @@ fn tool_defs() -> Value {
             "description": "Server statistics: index size (files/blocks/symbols/edges), embedding provider + coverage, cache version/path/bytes/age, server uptime, last index/embed/save timestamps. Call this to verify setup before relying on endex_ask.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "dir": { "type": "string" } }
+                "properties": {}
             }
         }
     ])
@@ -259,69 +261,57 @@ fn tool_err(msg: &str) -> Value {
     })
 }
 
-/// Extract the JSON payload of one inbound message. Supports both
-/// newline-delimited JSON and `Content-Length`-framed messages.
-fn read_message(stdin: &mut dyn BufRead, buf: &mut Vec<u8>) -> io::Result<Option<Value>> {
+/// Cap on a single framed message body — guards against absurd
+/// Content-Length values allocating gigabytes.
+const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Extract the JSON payload of one inbound message. Supports
+/// newline-delimited JSON (single objects AND JSON-RPC batch arrays) and
+/// `Content-Length`-framed messages.
+///
+/// Robustness contract: a malformed line yields `Value::Null` (skipped by
+/// the caller) and NEVER corrupts the stream for subsequent messages.
+pub fn read_message(stdin: &mut dyn BufRead, buf: &mut Vec<u8>) -> io::Result<Option<Value>> {
     buf.clear();
-    let mut byte = [0u8; 1];
-    // Peek at the first non-whitespace byte to detect framing.
-    let first = loop {
-        match stdin.read(&mut byte) {
-            Ok(0) => return Ok(None), // EOF
-            Ok(_) => {
-                let c = byte[0];
-                if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' {
-                    continue;
-                }
-                break c;
-            }
-            Err(e) => return Err(e),
-        }
-    };
-
-    if first == b'{' {
-        // Newline-delimited JSON.
-        buf.push(first);
-        stdin.read_until(b'\n', buf)?;
-        let s = String::from_utf8_lossy(buf);
-        let trimmed = s.trim();
-        if trimmed.is_empty() {
-            return Ok(Some(Value::Null));
-        }
-        return Ok(Some(serde_json::from_str(trimmed).unwrap_or(Value::Null)));
+    if stdin.read_until(b'\n', buf)? == 0 {
+        return Ok(None); // EOF
     }
-
-    // Assume Content-Length framing.
-    let mut content_length: Option<usize> = None;
-    buf.push(first);
+    let line = String::from_utf8_lossy(buf);
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(Some(Value::Null));
+    }
+    if line.starts_with('{') || line.starts_with('[') {
+        // Newline-delimited JSON (object or batch array).
+        return Ok(Some(serde_json::from_str(line).unwrap_or(Value::Null)));
+    }
+    // Header framing — only entered when the first header declares a length,
+    // so random garbage lines are skipped instead of eating the stream.
+    let lower = line.to_lowercase();
+    let Some(rest) = lower.strip_prefix("content-length:") else {
+        return Ok(Some(Value::Null));
+    };
+    let Some(n) = rest.trim().parse::<usize>().ok() else {
+        return Ok(Some(Value::Null));
+    };
+    if n > MAX_MESSAGE_BYTES {
+        return Ok(Some(Value::Null));
+    }
+    // Consume remaining header lines up to the blank separator.
     loop {
-        let mut line = Vec::new();
-        stdin.read_until(b'\n', &mut line)?;
-        let text = String::from_utf8_lossy(&line);
-        let text = text.trim();
-        if text.is_empty() {
-            break; // end of headers
+        buf.clear();
+        if stdin.read_until(b'\n', buf)? == 0 {
+            return Ok(None); // EOF mid-headers
         }
-        if let Some(rest) = text.to_lowercase().strip_prefix("content-length:") {
-            content_length = rest.trim().parse().ok();
+        if String::from_utf8_lossy(buf).trim().is_empty() {
+            break;
         }
     }
-    let n = match content_length {
-        Some(n) => n,
-        None => return Ok(Some(Value::Null)),
-    };
     let mut body = vec![0u8; n];
-    let mut read = 0;
-    while read < n {
-        match stdin.read(&mut body[read..]) {
-            Ok(0) => break,
-            Ok(k) => read += k,
-            Err(e) => return Err(e),
-        }
+    if stdin.read_exact(&mut body).is_err() {
+        return Ok(None); // EOF mid-body
     }
-    Ok(Some(
-        serde_json::from_slice(&body[..read]).unwrap_or(Value::Null),
-    ))
+    Ok(Some(serde_json::from_slice(&body).unwrap_or(Value::Null)))
 }
 
 fn write_message(out: &mut dyn io::Write, msg: &Value) {
@@ -392,21 +382,7 @@ fn symbol_summary(idx: &Index, g: &Graph, id: u32) -> Value {
 
 /// Fraction of live blocks that currently have semantic vectors.
 fn coverage(idx: &Index, emb: &Embeddings) -> f32 {
-    let live = idx
-        .blocks
-        .iter()
-        .filter(|b| b.file != crate::index::TOMBSTONE_FILE)
-        .count();
-    if live == 0 {
-        return 1.0;
-    }
-    let covered = idx
-        .blocks
-        .iter()
-        .filter(|b| b.file != crate::index::TOMBSTONE_FILE)
-        .filter(|b| emb.map.contains_key(&embed::fnv64(&b.text)))
-        .count();
-    covered as f32 / live as f32
+    embed::coverage_of(idx, emb)
 }
 
 fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
@@ -414,7 +390,7 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
     match name {
         "endex_index" => {
             let sh_arc = shared();
-            let mut sh = sh_arc.lock().unwrap();
+            let mut sh = mlock(&sh_arc);
             // A watcher keeps the index fresh; a manual call forces a refresh.
             let root = sh.root.clone();
             let changed = sh.idx.refresh(&root);
@@ -425,7 +401,7 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
             }
             let idx = &sh.idx;
             let emb_arc = emb();
-            let emb = emb_arc.read().unwrap();
+            let emb = rlock(&emb_arc);
             let payload = json!({
                 "dir": sh.root,
                 "refreshed_files": changed,
@@ -443,11 +419,13 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
 
         "endex_stats" => {
             let sh_arc = shared();
-            let sh = sh_arc.lock().unwrap();
+            let sh = mlock(&sh_arc);
             let emb_store = emb();
-            let emb = emb_store.read().unwrap();
+            let emb = rlock(&emb_store);
             let payload = stats_payload(&sh, &emb, provider);
-            tool_ok(payload.to_string())
+            // Wrapped in the same meta envelope as every other tool.
+            let m = meta(&sh, payload, t0.elapsed().as_secs_f64() * 1000.0);
+            tool_ok(m.to_string())
         }
 
         "endex_search" => {
@@ -457,7 +435,7 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
             };
             let limit = arg_usize(args, "limit", 20).min(100);
             let sh_arc = shared();
-            let sh = sh_arc.lock().unwrap();
+            let sh = mlock(&sh_arc);
             let idx = &sh.idx;
             let hits = search::search(idx, query, limit);
             let out: Vec<Value> = hits
@@ -482,14 +460,19 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
                 _ => return tool_err("missing required argument: query"),
             };
             let limit = arg_usize(args, "limit", 20).min(100);
+            // Embed the query BEFORE taking any lock: this HTTP round-trip
+            // must never block the watcher, the embedder, or other tools.
+            let qv = provider.embed_query(query);
             let sh_arc = shared();
-            let sh = sh_arc.lock().unwrap();
+            let sh = mlock(&sh_arc);
             let idx = &sh.idx;
-            let emb = emb().read().unwrap().clone(); // snapshot, cheap vs HTTP
-                                                     // ask_fast: embeds ONLY the query, never the corpus. The
-                                                     // background embedder keeps block vectors warm; coverage tells
-                                                     // the caller how semantic the current results are.
-            match embed::ask_fast(idx, &emb, provider, query, limit) {
+            // Read guard, NOT a clone: scoring only needs &Embeddings.
+            let emb_arc = emb();
+            let emb = rlock(&emb_arc);
+            // ask_fast embeds ONLY the query, never the corpus. The
+            // background embedder keeps block vectors warm; coverage tells
+            // the caller how semantic the current results are.
+            match qv.map(|qv| embed::ask_fast_with_qv(idx, &emb, &qv, query, limit)) {
                 Ok((hits, cov)) => {
                     let out: Vec<Value> = hits
                         .iter()
@@ -546,7 +529,7 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
                 _ => return tool_err("missing required argument: symbol"),
             };
             let sh_arc = shared();
-            let sh = sh_arc.lock().unwrap();
+            let sh = mlock(&sh_arc);
             let idx = &sh.idx;
             let g = &idx.graph;
             let ids = g.find_all(sym);
@@ -574,7 +557,7 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
             };
             let limit = arg_usize(args, "limit", 15).min(100);
             let sh_arc = shared();
-            let sh = sh_arc.lock().unwrap();
+            let sh = mlock(&sh_arc);
             let idx = &sh.idx;
             let g = &idx.graph;
             let hits = search::search(idx, term, limit);
@@ -636,7 +619,7 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
             let max_depth = arg_usize(args, "max_depth", 8).clamp(2, 32);
             let include_blocks = arg_bool(args, "include_blocks", true);
             let sh_arc = shared();
-            let sh = sh_arc.lock().unwrap();
+            let sh = mlock(&sh_arc);
             let idx = &sh.idx;
             let g = &idx.graph;
             let sources = g.find_all(from);
@@ -718,10 +701,13 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
 // ---------- background tasks ----------
 
 /// Filesystem watcher: reindexes changed files, rebuilds the graph, saves
-/// the cache, and pokes the embedder via the change epoch.
+/// the cache, and pokes the embedder via the change epoch. Changed paths
+/// are filtered through the same ignore rules as full walks — otherwise
+/// gitignored secrets (`.env`) and build output (`target/`, `node_modules`)
+/// would leak into the index (and from there to the embedding provider).
 fn spawn_watcher() {
     let sh = shared();
-    let root = sh.lock().unwrap().root.clone();
+    let root = mlock(&sh).root.clone();
     std::thread::spawn(move || {
         let rx = match watch::watch(&root) {
             Ok(rx) => rx,
@@ -730,47 +716,58 @@ fn spawn_watcher() {
                 return;
             }
         };
+        let mut ignores = watch::Ignores::new(&root);
         for batch in rx.iter() {
-            let sh_arc = shared();
-            let mut sh = sh_arc.lock().unwrap();
-            let mut n = 0usize;
-            for p in &batch {
-                if p.file_name()
-                    .map(|f| SELF_WRITTEN.iter().any(|s| f == *s))
-                    .unwrap_or(false)
-                    || p.components().any(|c| c.as_os_str() == ".git")
-                {
-                    continue;
-                }
-                if !p.is_file() {
-                    sh.idx.remove_file(p);
-                    continue;
-                }
-                if sh.idx.index_file(p) {
-                    n += 1;
-                }
-            }
-            if n > 0 {
-                sh.idx.finalize(); // rebuild graph + GC embeddings in memory
-                let now = unix_now();
-                sh.stats.indexed_files += n;
-                sh.stats.index_runs += 1;
-                sh.stats.last_index_unix = Some(now);
-                sh.dirty = true;
-                let root = sh.root.clone();
-                if store::save(&sh.idx, &root).is_ok() {
-                    sh.stats.last_save_unix = Some(now);
-                }
-                sh.dirty = false;
-                change_epoch().fetch_add(1, Ordering::SeqCst);
-                eprintln!("endex MCP: reindexed {n} changed file(s)");
+            // A panicking batch must not kill the watcher thread.
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle_watch_batch(&batch, &mut ignores)
+            }));
+            if r.is_err() {
+                eprintln!("endex MCP: watcher panicked on a change batch; continuing");
             }
         }
     });
 }
 
+fn handle_watch_batch(batch: &[PathBuf], ignores: &mut watch::Ignores) {
+    let sh_arc = shared();
+    let mut sh = mlock(&sh_arc);
+    let mut n = 0usize;
+    for p in batch {
+        if ignores.is_ignored(p, p.is_dir()) {
+            continue;
+        }
+        if !p.is_file() {
+            sh.idx.remove_file(p);
+            continue;
+        }
+        if sh.idx.index_file(p) {
+            n += 1;
+        }
+    }
+    if n > 0 {
+        sh.idx.finalize(); // rebuild graph + GC embeddings in memory
+        let now = unix_now();
+        sh.stats.indexed_files += n;
+        sh.stats.index_runs += 1;
+        sh.stats.last_index_unix = Some(now);
+        sh.dirty = true;
+        let root = sh.root.clone();
+        if store::save(&sh.idx, &root).is_ok() {
+            // Saved: only clear dirty on SUCCESS so the shutdown flush still
+            // persists after a failed save.
+            sh.stats.last_save_unix = Some(now);
+            sh.dirty = false;
+        }
+        change_epoch().fetch_add(1, Ordering::SeqCst);
+        eprintln!("endex MCP: reindexed {n} changed file(s)");
+    }
+}
+
 /// Background embedder: keeps block vectors warm. Runs once at startup and
 /// again whenever the watcher reports changes; never blocks tool calls.
+/// Embeds into a delta store and merges it back under a brief write lock —
+/// no full-store clones except the one snapshot needed to persist the cache.
 fn spawn_embedder(provider: Provider) {
     std::thread::spawn(move || {
         let mut seen_epoch = 0usize;
@@ -783,49 +780,82 @@ fn spawn_embedder(provider: Provider) {
             }
             seen_epoch = epoch;
 
-            // 1. Short lock: reset-for-provider + collect missing texts.
-            let (missing, root) = {
-                let sh_arc = shared();
-                let sh = sh_arc.lock().unwrap();
-                let mut snapshot = emb().read().unwrap().clone();
-                embed::reset_for_provider(&mut snapshot, &provider);
-                // Write back the (possibly reset) snapshot so coverage is
-                // honest while we work.
-                let m = embed::collect_missing(&sh.idx, &snapshot);
-                *emb().write().unwrap() = snapshot;
-                (m, sh.root.clone())
-            };
-            if missing.is_empty() {
-                continue;
-            }
-            let total = missing.len();
-            eprintln!("endex MCP: embedding {total} block(s) in background");
-
-            // 2. NO lock held: slow HTTP embedding into a working copy.
-            let mut work = emb().read().unwrap().clone();
-            let before = work.map.len();
-            match embed::embed_texts(&mut work, &provider, missing, false) {
-                Ok(()) => {
-                    let added = work.map.len().saturating_sub(before);
-                    // 3. Brief write lock to swap in the new vectors, then
-                    // persist through the index copy for cache round-trips.
-                    *emb().write().unwrap() = work.clone();
-                    let sh_arc = shared();
-                    let mut sh = sh_arc.lock().unwrap();
-                    sh.idx.embeddings = work;
-                    let _ = store::save(&sh.idx, &root);
-                    eprintln!("endex MCP: embedded {added}/{total} block(s) in background");
+            let pass =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| embed_pass(&provider)));
+            match pass {
+                Ok(Ok((added, total))) => {
+                    if total > 0 {
+                        eprintln!("endex MCP: embedded {added}/{total} block(s) in background");
+                    }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     // Provider down (e.g. Ollama not running): back off so we
                     // don't spin; the watcher epoch will retry us later.
                     eprintln!("endex MCP: background embed failed: {e} (retrying in 30s)");
                     std::thread::sleep(std::time::Duration::from_secs(30));
-                    seen_epoch = 0; // force retry
+                    seen_epoch = 0; // force retry (epoch is always >= 1; cf. run)
+                }
+                Err(_) => {
+                    eprintln!("endex MCP: embedder panicked on a pass; continuing");
                 }
             }
         }
     });
+}
+
+/// One embed pass. Returns (added, total-missing); error = provider failure.
+fn embed_pass(provider: &Provider) -> Result<(usize, usize), String> {
+    // 1. Short locks: reset-for-provider in place + collect missing texts.
+    let (missing, root) = {
+        let sh_arc = shared();
+        let sh = mlock(&sh_arc);
+        {
+            let emb_arc = emb();
+            let mut w = wlock(&emb_arc);
+            embed::reset_for_provider(&mut w, provider);
+        }
+        let emb_arc = emb();
+        let guard = rlock(&emb_arc);
+        let m = embed::collect_missing(&sh.idx, &guard);
+        (m, sh.root.clone())
+    };
+    if missing.is_empty() {
+        return Ok((0, 0));
+    }
+    let total = missing.len();
+    eprintln!("endex MCP: embedding {total} block(s) in background");
+
+    // 2. NO lock held: slow HTTP embedding into a fresh delta store.
+    let mut delta = Embeddings {
+        provider_id: provider.id(),
+        dim: rlock(&emb()).dim,
+        map: std::collections::HashMap::new(),
+    };
+    embed::embed_texts(&mut delta, provider, missing, false)?;
+    let added = delta.map.len();
+
+    // 3. Brief write lock to merge the delta, then persist a snapshot
+    //    through the index copy for cache round-trips.
+    {
+        let emb_arc = emb();
+        let mut w = wlock(&emb_arc);
+        if w.dim == 0 {
+            w.dim = delta.dim;
+        }
+        w.map.extend(delta.map);
+    }
+    let snapshot = rlock(&emb()).clone();
+    let sh_arc = shared();
+    let mut sh = mlock(&sh_arc);
+    sh.idx.embeddings = snapshot;
+    let now = unix_now();
+    if store::save(&sh.idx, &root).is_ok() {
+        sh.stats.last_save_unix = Some(now);
+    }
+    sh.stats.embed_runs += 1;
+    sh.stats.last_embed_unix = Some(now);
+    sh.stats.last_embed_blocks = added;
+    Ok((added, total))
 }
 
 // ---------- main loop ----------
@@ -969,7 +999,12 @@ pub fn run(dir: String, use_cache: bool, provider: Provider) {
                     let params = req.get("params").cloned().unwrap_or(json!({}));
                     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                     let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                    let result = exec_tool(&provider, name, &args);
+                    // A panicking tool must return an error, not kill the server
+                    // (release profile no longer uses panic = "abort").
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        exec_tool(&provider, name, &args)
+                    }))
+                    .unwrap_or_else(|_| tool_err("internal error: endex tool panicked"));
                     rpc_ok(&id, result)
                 }
                 "notifications/initialized" | "notifications/cancelled" => continue,
@@ -990,7 +1025,7 @@ pub fn run(dir: String, use_cache: bool, provider: Provider) {
 
     // Save on shutdown if the watcher left unsaved changes.
     let sh_arc = shared();
-    let mut sh = sh_arc.lock().unwrap();
+    let mut sh = mlock(&sh_arc);
     if sh.dirty {
         let root = sh.root.clone();
         let _ = store::save(&sh.idx, &root);

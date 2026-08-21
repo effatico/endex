@@ -9,6 +9,7 @@ pub mod embed;
 pub mod graph;
 pub mod index;
 pub mod mcp;
+pub mod output;
 pub mod search;
 pub mod store;
 pub mod watch;

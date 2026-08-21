@@ -90,61 +90,74 @@ pub struct Provider {
     pub dim: usize,
 }
 
+/// Options for `Provider::resolve`. Every field is optional; anything unset
+/// falls back to the EMBED_* environment variables, then to defaults.
+#[derive(Default, Clone)]
+pub struct ProviderOpts {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub url: Option<String>,
+    pub key: Option<String>,
+    pub dim: Option<usize>,
+    pub batch: Option<usize>,
+}
+
 impl Provider {
     /// Resolve provider settings from CLI options with env-var fallbacks:
     /// EMBED_PROVIDER, EMBED_URL, EMBED_MODEL, EMBED_API_KEY / OPENAI_API_KEY,
     /// EMBED_DIM, EMBED_BATCH.
-    #[allow(clippy::too_many_arguments)]
-    pub fn resolve(
-        provider: Option<&str>,
-        model: Option<&str>,
-        url: Option<&str>,
-        key: Option<&str>,
-        dim: Option<usize>,
-        batch: Option<usize>,
-    ) -> Provider {
+    pub fn resolve(opts: &ProviderOpts) -> Provider {
         let env = |name: &str| std::env::var(name).ok().filter(|s| !s.is_empty());
-        let name = provider
-            .map(str::to_string)
+        let name = opts
+            .provider
+            .clone()
             .or_else(|| env("EMBED_PROVIDER"))
             .unwrap_or_else(|| "hash".into());
         match name.as_str() {
             "cohere" => Provider {
                 kind: ProviderKind::Cohere,
-                url: url
-                    .map(str::to_string)
+                url: opts
+                    .url
+                    .clone()
                     .or_else(|| env("EMBED_URL"))
                     .unwrap_or_else(|| "https://api.cohere.com/v2".into()),
-                model: model
-                    .map(str::to_string)
+                model: opts
+                    .model
+                    .clone()
                     .or_else(|| env("EMBED_MODEL"))
                     .unwrap_or_else(|| "embed-v4.0".into()),
-                key: key
-                    .map(str::to_string)
+                key: opts
+                    .key
+                    .clone()
                     .or_else(|| env("EMBED_API_KEY"))
                     .or_else(|| env("COHERE_API_KEY"))
                     .unwrap_or_default(),
-                batch: batch
+                batch: opts
+                    .batch
                     .or_else(|| env("EMBED_BATCH").and_then(|s| s.parse().ok()))
                     .unwrap_or(96), // Cohere's per-request limit
                 dim: 0,
             },
             "openai" | "http" | "remote" => Provider {
                 kind: ProviderKind::Http,
-                url: url
-                    .map(str::to_string)
+                url: opts
+                    .url
+                    .clone()
                     .or_else(|| env("EMBED_URL"))
                     .unwrap_or_else(|| "https://api.openai.com/v1".into()),
-                model: model
-                    .map(str::to_string)
+                model: opts
+                    .model
+                    .clone()
                     .or_else(|| env("EMBED_MODEL"))
                     .unwrap_or_else(|| "text-embedding-3-small".into()),
-                key: key
-                    .map(str::to_string)
+                key: opts
+                    .key
+                    .clone()
                     .or_else(|| env("EMBED_API_KEY"))
                     .or_else(|| env("OPENAI_API_KEY"))
                     .unwrap_or_default(),
-                batch: batch
+                batch: opts
+                    .batch
                     .or_else(|| env("EMBED_BATCH").and_then(|s| s.parse().ok()))
                     .unwrap_or(64),
                 dim: 0,
@@ -154,10 +167,12 @@ impl Provider {
                 url: String::new(),
                 model: "hash".into(),
                 key: String::new(),
-                batch: batch
+                batch: opts
+                    .batch
                     .or_else(|| env("EMBED_BATCH").and_then(|s| s.parse().ok()))
                     .unwrap_or(4096),
-                dim: dim
+                dim: opts
+                    .dim
                     .or_else(|| env("EMBED_DIM").and_then(|s| s.parse().ok()))
                     .unwrap_or(256),
             },
@@ -310,8 +325,8 @@ pub fn ensure(
         .blocks
         .par_iter()
         .filter(|b| b.file != TOMBSTONE_FILE)
-        .filter(|b| !emb.map.contains_key(&fnv64(&b.text)))
-        .map(|b| (fnv64(&b.text), b.text.clone()))
+        .filter(|b| !emb.map.contains_key(&b.hash))
+        .map(|b| (b.hash, b.text.clone()))
         .collect();
     if missing.is_empty() {
         return Ok(());
@@ -378,8 +393,8 @@ pub fn collect_missing(index: &Index, emb: &Embeddings) -> HashMap<u64, String> 
         .blocks
         .par_iter()
         .filter(|b| b.file != TOMBSTONE_FILE)
-        .filter(|b| !emb.map.contains_key(&fnv64(&b.text)))
-        .map(|b| (fnv64(&b.text), b.text.clone()))
+        .filter(|b| !emb.map.contains_key(&b.hash))
+        .map(|b| (b.hash, b.text.clone()))
         .collect()
 }
 
@@ -411,7 +426,7 @@ pub fn top_k(index: &Index, emb: &Embeddings, q: &[f32], k: usize) -> Vec<(f32, 
         .par_iter()
         .enumerate()
         .filter(|(_, b)| b.file != TOMBSTONE_FILE)
-        .filter_map(|(i, b)| emb.map.get(&fnv64(&b.text)).map(|v| (dot(q, v), i as u32)))
+        .filter_map(|(i, b)| emb.map.get(&b.hash).map(|v| (dot(q, v), i as u32)))
         .collect();
     scores.sort_by(|a, b| b.0.total_cmp(&a.0));
     scores.truncate(k);
@@ -459,26 +474,43 @@ pub fn ask_fast(
     query: &str,
     limit: usize,
 ) -> Result<(Vec<(f32, search::Hit)>, f32), String> {
+    let qv = prov.embed_query(query)?;
+    Ok(ask_fast_with_qv(idx, emb, &qv, query, limit))
+}
+
+/// `ask_fast` with a pre-embedded query vector. Splitting the HTTP call
+/// (embed the query) from the scoring lets servers run the network part
+/// WITHOUT holding any index/embedding lock.
+pub fn ask_fast_with_qv(
+    idx: &Index,
+    emb: &Embeddings,
+    qv: &[f32],
+    query: &str,
+    limit: usize,
+) -> (Vec<(f32, search::Hit)>, f32) {
+    let coverage = coverage_of(idx, emb);
+    let sem = top_k(idx, emb, qv, 200);
+    let lex = search::search(idx, query, 200);
+    (fuse(idx, &lex, &sem, query, limit), coverage)
+}
+
+/// Fraction of live blocks that currently have vectors (1.0 = fully warm).
+pub fn coverage_of(idx: &Index, emb: &Embeddings) -> f32 {
     let live = idx
         .blocks
         .iter()
         .filter(|b| b.file != TOMBSTONE_FILE)
         .count();
+    if live == 0 {
+        return 1.0;
+    }
     let covered = idx
         .blocks
         .iter()
         .filter(|b| b.file != TOMBSTONE_FILE)
-        .filter(|b| emb.map.contains_key(&fnv64(&b.text)))
+        .filter(|b| emb.map.contains_key(&b.hash))
         .count();
-    let coverage = if live == 0 {
-        1.0
-    } else {
-        covered as f32 / live as f32
-    };
-    let qv = prov.embed_query(query)?;
-    let sem = top_k(idx, emb, &qv, 200);
-    let lex = search::search(idx, query, 200);
-    Ok((fuse(idx, &lex, &sem, query, limit), coverage))
+    covered as f32 / live as f32
 }
 
 fn fuse(

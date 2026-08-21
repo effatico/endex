@@ -620,6 +620,33 @@ fn rel_of(root: &std::path::Path, path: &std::path::Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().into_owned())
 }
 
+/// Names with more definitions than this and no same-file candidate are not
+/// linked at all: global name-matching on ultra-common names (`new`, `get`,
+/// `run`, ...) produces pure noise.
+const MAX_GLOBAL_CALL_TARGETS: usize = 25;
+
+/// Resolve a bare `name(` call to the likeliest definitions. Edges are
+/// name-based (no type info), so disambiguate: a definition in the SAME
+/// file always wins; otherwise link all candidates, unless the name is so
+/// common the edges would be meaningless.
+fn resolve_call_targets(targets: &[u32], from_file: u32, sym_files: &[u32]) -> Vec<u32> {
+    if targets.len() <= 1 {
+        return targets.to_vec();
+    }
+    let same_file: Vec<u32> = targets
+        .iter()
+        .copied()
+        .filter(|&t| sym_files[t as usize] == from_file)
+        .collect();
+    if !same_file.is_empty() {
+        return same_file;
+    }
+    if targets.len() > MAX_GLOBAL_CALL_TARGETS {
+        return Vec::new();
+    }
+    targets.to_vec()
+}
+
 /// Rebuild the whole graph from in-memory index state (no disk reads).
 pub fn rebuild(index: &Index) -> Graph {
     let mut g = Graph::default();
@@ -674,6 +701,7 @@ pub fn rebuild(index: &Index) -> Graph {
     // 2. Call edges: for each file, scan its blocks; attribute each
     //    `name(` occurrence to the enclosing definition.
     let by_name = &g.by_name;
+    let sym_files: Vec<u32> = g.symbols.iter().map(|s| s.file).collect();
     let edge_lists: Vec<Vec<(u32, u32)>> = file_list
         .par_iter()
         .map(|(_, fe)| {
@@ -701,7 +729,7 @@ pub fn rebuild(index: &Index) -> Graph {
                             continue;
                         }
                         if let Some(targets) = by_name.get(tok) {
-                            for &t in targets {
+                            for t in resolve_call_targets(targets, fe.id, &sym_files) {
                                 if t != cur {
                                     local.push((cur, t));
                                 }

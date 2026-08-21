@@ -11,9 +11,6 @@ import { EndexMcpClient } from "./client.js";
  *   curl -fsSL https://raw.githubusercontent.com/effatico/endex/main/install.sh | sh
  */
 
-const Dir = Type.Optional(
-  Type.String({ description: "Directory to query. Default: project root pi was started in." }),
-);
 const Limit = Type.Optional(Type.Integer({ description: "Max results (default 20, max 100)." }));
 
 const client = new EndexMcpClient({
@@ -40,7 +37,6 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: Type.Object({
       query: Type.String({ description: "Case-insensitive substring to find." }),
-      dir: Dir,
       limit: Limit,
     }),
     async execute(_id, params) {
@@ -59,7 +55,6 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: Type.Object({
       query: Type.String({ description: "Natural language question or description of the code." }),
-      dir: Dir,
       limit: Limit,
     }),
     async execute(_id, params) {
@@ -78,7 +73,6 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: Type.Object({
       symbol: Type.String({ description: "Symbol name (function, method, class, struct, ...)." }),
-      dir: Dir,
     }),
     async execute(_id, params) {
       return textResult(await client.callTool("endex_graph", params));
@@ -97,7 +91,6 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       from: Type.String({ description: "Source symbol name — an entry point like main, a handler, an exported API." }),
       to: Type.String({ description: "Target symbol name — the downstream function to trace into." }),
-      dir: Dir,
       include_blocks: Type.Optional(
         Type.Boolean({ description: "Include source text of each hop's block (default true)." }),
       ),
@@ -116,7 +109,6 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Blocks mentioning a term, annotated with defined symbols",
     parameters: Type.Object({
       term: Type.String({ description: "Concept word to investigate." }),
-      dir: Dir,
       limit: Limit,
     }),
     async execute(_id, params) {
@@ -130,7 +122,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Build or refresh the endex code index for a directory. Rarely needed: the endex server watches the filesystem and self-refreshes. Call this only to force a refresh or to warm a fresh checkout.",
     promptSnippet: "Build/refresh the code index (usually automatic)",
-    parameters: Type.Object({ dir: Dir }),
+    parameters: Type.Object({}),
     async execute(_id, params) {
       return textResult(await client.callTool("endex_index", params));
     },
@@ -142,7 +134,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Check the endex server/index state: files, blocks, symbols, embedding provider + coverage, cache version/age, last index/embed/save timestamps. Call this to verify setup before relying on endex_ask (coverage < 1 means the background embedder is still warming).",
     promptSnippet: "Server and index stats + semantic coverage",
-    parameters: Type.Object({ dir: Dir }),
+    parameters: Type.Object({}),
     async execute(_id, params) {
       return textResult(await client.callTool("endex_stats", params));
     },
@@ -157,9 +149,15 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("endex server stopped; it respawns on next tool call", "info");
         return;
       }
+      if (sub && sub !== "stats" && sub !== "status") {
+        ctx.ui.notify("usage: /endex stats | /endex restart", "info");
+        return;
+      }
       try {
         const out = await client.callTool("endex_stats", {});
-        const s = JSON.parse(out);
+        const raw = JSON.parse(out);
+        // Stats are wrapped in the same meta envelope as every other tool.
+        const s = raw.meta?.data ?? raw;
         ctx.ui.notify(
           `endex: ${s.index?.files ?? "?"} files · ${s.index?.blocks ?? "?"} blocks · ${s.index?.symbols ?? "?"} symbols · ${s.embeddings?.vectors ?? "?"} vectors (${Math.round((s.embeddings?.coverage ?? 0) * 100)}% semantic · cache v${s.cache?.version ?? "?"})`,
           "info",
