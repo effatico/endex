@@ -17,22 +17,22 @@ class Endex < Formula
   on_macos do
     on_arm do
       url "https://github.com/effatico/endex/releases/download/v#{version}/endex-aarch64-apple-darwin.tar.gz"
-      sha256 "REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256"
+      sha256 "0ceed0bcc810c86c18083af047053d133f5fcdab17fde95be30a7eb89ba10f14"
     end
     on_intel do
       url "https://github.com/effatico/endex/releases/download/v#{version}/endex-x86_64-apple-darwin.tar.gz"
-      sha256 "REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256"
+      sha256 "bfcd8c6ca6847d8715ebd74b20d4bb68a97462aa485c65ecf81a65041cf2d87c"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/effatico/endex/releases/download/v#{version}/endex-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "REPLACE_WITH_AARCH64_LINUX_SHA256"
+      sha256 "2c7607ad43aa4fc32646b588e2b7fa5f0f485bac773e8b2ff6c81cbf6745b942"
     end
     on_intel do
       url "https://github.com/effatico/endex/releases/download/v#{version}/endex-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "REPLACE_WITH_X86_64_LINUX_SHA256"
+      sha256 "10a70edd76c7038575dc0e768cc48e2eb366dd626057f4cdedb988c2e60f8f01"
     end
   end
 
