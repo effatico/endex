@@ -69,7 +69,11 @@ fn builds_and_finds_substrings_case_insensitively() {
 
     let hits = search::search(&idx, "calculate_tax", 10);
     assert_eq!(hits.len(), 1);
-    assert!(idx.path_of(hits[0].file_id).ends_with("src/lib.rs"));
+    // Separator-agnostic: Windows paths use backslashes.
+    assert!(idx
+        .path_of(hits[0].file_id)
+        .replace('\\', "/")
+        .ends_with("src/lib.rs"));
     assert_eq!(hits[0].line, 1);
 
     // Case-insensitive.
