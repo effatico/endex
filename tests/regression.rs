@@ -161,8 +161,10 @@ fn repeated_edits_and_recreated_files_keep_postings_consistent() {
     idx.build(tmp.path());
 
     // Many edits: each tombstones the old block and recycles the id.
+    // Content length grows each round so change detection (mtime+len) works
+    // even on filesystems with coarse mtime granularity (Windows runners).
     for i in 2..20 {
-        fs::write(&f, format!("fn version_{i}() {{}}\n")).unwrap();
+        fs::write(&f, format!("fn version_{i}() {{}} {}\n", "//".repeat(i))).unwrap();
         assert!(idx.index_file(&f));
     }
     // Only the latest content is searchable, exactly once.
