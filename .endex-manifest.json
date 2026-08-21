@@ -1,8 +1,0 @@
-{
-  "embedding_provider": "cohere:embed-v4.0@https://api.cohere.com/v2",
-  "corpus_fingerprint": 1815768972976399056,
-  "files": 22,
-  "blocks": 530,
-  "embedding_vectors": 533,
-  "embedding_dim": 1536
-}

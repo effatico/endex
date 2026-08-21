@@ -25,3 +25,9 @@ rust-toolchain.toml
 # Environment
 .env
 .env.*
+
+# endex local index cache
+.endex-index.bin
+.endex-index.tmp
+.endex-manifest.json
+.endex-manifest.tmp
