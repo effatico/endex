@@ -25,7 +25,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
-const CACHE_FILENAME: &str = ".endex-index.bin";
+/// Files the server itself writes — the watcher must ignore them or it
+/// reindexes its own output forever.
+const SELF_WRITTEN: &[&str] = &[
+    ".endex-index.bin",
+    ".endex-index.tmp",
+    ".endex-manifest.json",
+    ".endex-manifest.tmp",
+];
 
 /// Global state shared by all tool calls and the background tasks.
 struct Shared {
@@ -389,6 +396,7 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
                     "embedding_dim": emb.dim,
                     "embedding_provider": provider.id(),
                     "semantic_coverage": coverage(idx, &emb),
+                    "corpus_fingerprint": format!("{:#x}", idx.corpus_fingerprint()),
                 })
                 .to_string(),
             )
@@ -428,9 +436,9 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
             let sh = sh_arc.lock().unwrap();
             let idx = &sh.idx;
             let emb = emb().read().unwrap().clone(); // snapshot, cheap vs HTTP
-            // ask_fast: embeds ONLY the query, never the corpus. The
-            // background embedder keeps block vectors warm; coverage tells
-            // the caller how semantic the current results are.
+                                                     // ask_fast: embeds ONLY the query, never the corpus. The
+                                                     // background embedder keeps block vectors warm; coverage tells
+                                                     // the caller how semantic the current results are.
             match embed::ask_fast(idx, &emb, provider, query, limit) {
                 Ok((hits, cov)) => {
                     let out: Vec<Value> = hits
@@ -674,7 +682,9 @@ fn spawn_watcher() {
             let mut sh = sh_arc.lock().unwrap();
             let mut n = 0usize;
             for p in &batch {
-                if p.file_name().map(|f| f == CACHE_FILENAME).unwrap_or(false)
+                if p.file_name()
+                    .map(|f| SELF_WRITTEN.iter().any(|s| f == *s))
+                    .unwrap_or(false)
                     || p.components().any(|c| c.as_os_str() == ".git")
                 {
                     continue;
@@ -730,6 +740,7 @@ fn spawn_embedder(provider: Provider) {
                 continue;
             }
             let total = missing.len();
+            eprintln!("endex MCP: embedding {total} block(s) in background");
 
             // 2. NO lock held: slow HTTP embedding into a working copy.
             let mut work = emb().read().unwrap().clone();
@@ -765,6 +776,20 @@ pub fn run(dir: String, use_cache: bool, provider: Provider) {
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(&dir));
 
+    // Manifest check (cheap): is the on-disk cache for the same embedding
+    // provider? If not, its vectors are useless — start the embedding store
+    // empty rather than trusting stale vectors in a different model space.
+    let manifest = store::load_manifest(&root);
+    if let Some(m) = &manifest {
+        if !m.embedding_provider.is_empty() && m.embedding_provider != provider.id() {
+            eprintln!(
+                "endex MCP: cache embeddings are for '{}' but provider is '{}' — re-embedding in background",
+                m.embedding_provider,
+                provider.id()
+            );
+        }
+    }
+
     // Load or build the index (fast: cache hit ~ms, full build ~hundreds of ms).
     let mut idx = if use_cache {
         match store::load(&root) {
@@ -781,16 +806,34 @@ pub fn run(dir: String, use_cache: bool, provider: Provider) {
         i.build(&root);
         i
     };
+
+    // Partial invalidation: if the cached tree differs from the current one,
+    // `refresh` re-parses only changed files (content-hash keying keeps the
+    // vectors of every unchanged block). Log how much changed.
+    let pre = idx.corpus_fingerprint();
     let changed = idx.refresh(&root);
     if changed > 0 {
+        eprintln!(
+            "endex MCP: partial refresh — {changed} file(s) changed since cache (fingerprint {pre:#x} -> {:#x})",
+            idx.corpus_fingerprint()
+        );
         let _ = store::save(&idx, &root);
     } else if idx.graph.symbols.is_empty() && !idx.files.is_empty() {
         idx.finalize();
     }
 
-    // The live embedding store starts from whatever the cache had; the
-    // background embedder keeps it warm from here on.
-    let emb_state = Arc::new(RwLock::new(idx.embeddings.clone()));
+    // The live embedding store starts from whatever the cache had — UNLESS
+    // the provider changed, in which case we start empty and let the
+    // background embedder repopulate it in the correct vector space.
+    let cached_emb = if idx.embeddings.provider_id == provider.id() {
+        idx.embeddings.clone()
+    } else {
+        Embeddings {
+            provider_id: provider.id(),
+            ..Embeddings::default()
+        }
+    };
+    let emb_state = Arc::new(RwLock::new(cached_emb));
     let shared_state = Arc::new(Mutex::new(Shared {
         root: root.clone(),
         idx,

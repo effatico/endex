@@ -77,6 +77,7 @@ fn hash_embed(text: &str, dim: usize) -> Vec<f32> {
 pub enum ProviderKind {
     Hash,
     Http,
+    Cohere,
 }
 
 #[derive(Clone)]
@@ -108,6 +109,26 @@ impl Provider {
             .or_else(|| env("EMBED_PROVIDER"))
             .unwrap_or_else(|| "hash".into());
         match name.as_str() {
+            "cohere" => Provider {
+                kind: ProviderKind::Cohere,
+                url: url
+                    .map(str::to_string)
+                    .or_else(|| env("EMBED_URL"))
+                    .unwrap_or_else(|| "https://api.cohere.com/v2".into()),
+                model: model
+                    .map(str::to_string)
+                    .or_else(|| env("EMBED_MODEL"))
+                    .unwrap_or_else(|| "embed-v4.0".into()),
+                key: key
+                    .map(str::to_string)
+                    .or_else(|| env("EMBED_API_KEY"))
+                    .or_else(|| env("COHERE_API_KEY"))
+                    .unwrap_or_default(),
+                batch: batch
+                    .or_else(|| env("EMBED_BATCH").and_then(|s| s.parse().ok()))
+                    .unwrap_or(96), // Cohere's per-request limit
+                dim: 0,
+            },
             "openai" | "http" | "remote" => Provider {
                 kind: ProviderKind::Http,
                 url: url
@@ -149,13 +170,25 @@ impl Provider {
         match self.kind {
             ProviderKind::Hash => format!("hash:{}", self.dim),
             ProviderKind::Http => format!("http:{}@{}", self.model, self.url),
+            ProviderKind::Cohere => format!("cohere:{}@{}", self.model, self.url),
         }
     }
 
+    /// Embed a batch of documents (code blocks).
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
         match self.kind {
             ProviderKind::Hash => Ok(texts.iter().map(|t| hash_embed(t, self.dim)).collect()),
             ProviderKind::Http => self.http_embed(texts),
+            ProviderKind::Cohere => self.cohere_embed(texts, "search_document"),
+        }
+    }
+
+    /// Embed a single search query. Providers with an asymmetric
+    /// document/query distinction (Cohere) use it; others reuse `embed`.
+    pub fn embed_query(&self, text: &str) -> Result<Vec<f32>, String> {
+        match self.kind {
+            ProviderKind::Cohere => Ok(self.cohere_embed(&[text], "search_query")?.remove(0)),
+            _ => Ok(self.embed(&[text])?.remove(0)),
         }
     }
 
@@ -199,6 +232,56 @@ impl Provider {
                 normalize(&mut d.embedding);
                 out.push(d.embedding);
             }
+        }
+        Ok(out)
+    }
+
+    /// Cohere `/embed` (v2): texts + input_type, float embeddings.
+    /// `input_type` is "search_document" for blocks and "search_query" for
+    /// queries — Cohere models are trained asymmetrically and this
+    /// materially improves retrieval quality.
+    fn cohere_embed(&self, texts: &[&str], input_type: &str) -> Result<Vec<Vec<f32>>, String> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[derive(Deserialize)]
+        struct CohereResp {
+            embeddings: CohereEmbeddings,
+        }
+        #[derive(Deserialize)]
+        struct CohereEmbeddings {
+            float: Vec<Vec<f32>>,
+        }
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(self.batch.max(1)) {
+            let mut req = ureq::post(&format!("{}/embed", self.url));
+            if !self.key.is_empty() {
+                req = req.set("Authorization", &format!("Bearer {}", self.key));
+            }
+            let resp = req
+                .timeout(Duration::from_secs(300))
+                .send_json(json!({
+                    "model": self.model,
+                    "texts": chunk,
+                    "input_type": input_type,
+                    "embedding_types": ["float"],
+                }))
+                .map_err(|e| format!("cohere embedding request failed: {e}"))?;
+            let parsed: CohereResp = resp
+                .into_json()
+                .map_err(|e| format!("bad cohere embedding response: {e}"))?;
+            let mut embs = parsed.embeddings.float;
+            if embs.len() != chunk.len() {
+                return Err(format!(
+                    "cohere embedding count mismatch: sent {}, got {}",
+                    chunk.len(),
+                    embs.len()
+                ));
+            }
+            for v in embs.iter_mut() {
+                normalize(v);
+            }
+            out.extend(embs);
         }
         Ok(out)
     }
@@ -248,7 +331,7 @@ pub fn reset_for_provider(emb: &mut Embeddings, prov: &Provider) {
             provider_id: prov.id(),
             dim: match prov.kind {
                 ProviderKind::Hash => prov.dim,
-                ProviderKind::Http => 0,
+                ProviderKind::Http | ProviderKind::Cohere => 0,
             },
             map: HashMap::new(),
         };
@@ -352,7 +435,7 @@ pub fn ask(
     let mut emb = std::mem::take(&mut idx.embeddings);
     let result = (|| -> Result<Vec<(f32, search::Hit)>, String> {
         ensure(&mut emb, prov, idx, true)?;
-        let qv = prov.embed(&[query])?.remove(0);
+        let qv = prov.embed_query(query)?;
         let sem = top_k(idx, &emb, &qv, 200);
         let lex = search::search(idx, query, 200);
         Ok(fuse(idx, &lex, &sem, query, limit))
@@ -392,7 +475,7 @@ pub fn ask_fast(
     } else {
         covered as f32 / live as f32
     };
-    let qv = prov.embed(&[query])?.remove(0);
+    let qv = prov.embed_query(query)?;
     let sem = top_k(idx, emb, &qv, 200);
     let lex = search::search(idx, query, 200);
     Ok((fuse(idx, &lex, &sem, query, limit), coverage))

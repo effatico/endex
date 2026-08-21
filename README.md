@@ -8,7 +8,7 @@ Three layers, all cached on disk and updated incrementally:
 
 1. **Trigram inverted index** (the approach behind Google Code Search / Zoekt): every 3-byte window of the corpus maps to a posting list of *block ids*. A query intersects the posting lists of its trigrams, producing a tiny candidate set that is verified exactly — arbitrary substring search runs in **microseconds to a few milliseconds** even on huge corpora.
 2. **Knowledge graph**: symbols (functions, methods, classes, structs, traits, interfaces...) and **call edges** between them, plus file-level **import edges**. Extracted heuristically per language (Rust, TS/JS, Python, Go, Java/C#/Kotlin) — a full graph rebuild is an in-memory pass of a few ms, so it refreshes live while you watch. Powers `graph` (who calls whom), `flow` (call paths between two symbols) and `clues` (blocks mentioning a term + the symbols defined there).
-3. **Embeddings**: every block gets a semantic vector, fused with the lexical ranking via reciprocal rank fusion (`ask`). Vectors are keyed by *content hash*, so editing a file only re-embeds changed blocks and moved code keeps its vectors.
+3. **Embeddings**: every block gets a semantic vector, fused with the lexical ranking via reciprocal rank fusion (`ask`). Vectors are keyed by *content hash* (fnv64 of block text), persisted in `.endex-index.bin`, and guarded by a `.endex-manifest.json` (provider id + corpus fingerprint). Editing a file only re-embeds its changed blocks, moved code keeps its vectors, and a cache written for a different embedding model is detected and ignored. Each source file also carries a `content_hash`, so the server can tell exactly which files invalidated and update just those.
 
 Code is chunked into blank-line-separated **blocks** (max 80 lines), so results are meaningful text blocks (functions, paragraphs, config sections). Everything is case-insensitive, gitignore-aware, skips binaries and files > 5 MB, and indexes in parallel via `rayon`.
 
@@ -18,10 +18,17 @@ Code is chunked into blank-line-separated **blocks** (max 80 lines), so results 
 |---|---|---|
 | `hash` (default) | `--embed-provider hash` | Deterministic feature-hashing embedding. Fully offline, instant, zero deps. Fuzzy lexical matching (typos, word variants) — not truly semantic. |
 | `openai` | `--embed-provider openai` | Any OpenAI-compatible `/embeddings` endpoint: OpenAI, **Ollama** (`--embed-url http://localhost:11434/v1`), LM Studio, vLLM, ... This is where real semantic search comes from — local *or* remote. |
+| `cohere` | `--embed-provider cohere` | Cohere `/embed` API (`embed-v4.0`, `embed-english-v3.0`, `embed-multilingual-v3.0`). Blocks embed as `search_document`, queries as `search_query` for best retrieval quality. Key via `--embed-key`, `EMBED_API_KEY`, or `COHERE_API_KEY`. |
 
 ```bash
 # remote (OpenAI)
 endex ask ~/my-repo "how do we handle retries" --embed-provider openai
+
+# remote (Cohere)
+endex ask ~/my-repo "how do we handle retries" \
+  --embed-provider cohere \
+  --embed-model embed-v4.0 \
+  --embed-key $COHERE_API_KEY
 
 # local (Ollama running on your machine)
 endex ask ~/my-repo "how do we handle retries" \
@@ -30,7 +37,7 @@ endex ask ~/my-repo "how do we handle retries" \
   --embed-model nomic-embed-text
 ```
 
-Env-var equivalents: `EMBED_PROVIDER`, `EMBED_URL`, `EMBED_MODEL`, `EMBED_API_KEY` / `OPENAI_API_KEY`, `EMBED_DIM`, `EMBED_BATCH`. If the provider is unreachable, `ask` falls back to lexical search with a warning.
+Env-var equivalents: `EMBED_PROVIDER`, `EMBED_URL`, `EMBED_MODEL`, `EMBED_API_KEY` / `OPENAI_API_KEY` / `COHERE_API_KEY`, `EMBED_DIM`, `EMBED_BATCH`. If the provider is unreachable, `ask` falls back to lexical search with a warning.
 
 ## Usage
 
@@ -133,7 +140,7 @@ src/
 ├── graph.rs   knowledge graph: symbol/def extraction, call edges, import resolution, path queries
 ├── embed.rs   embedding providers (hash / OpenAI-compatible HTTP), content-hash vector cache, RRF fusion
 ├── search.rs  posting-list intersection + parallel verification, ranking
-├── store.rs   atomic bincode cache (versioned magic header, tmp+rename)
+├── store.rs   atomic bincode cache (versioned magic header, tmp+rename) + JSON manifest (provider id, corpus fingerprint)
 ├── mcp.rs     MCP stdio server: JSON-RPC loop + tool handlers (initialize / tools/list / tools/call)
 └── watch.rs   debounced recursive filesystem watcher
 ```

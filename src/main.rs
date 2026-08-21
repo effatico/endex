@@ -41,10 +41,11 @@ OPTIONS:
   --limit N            max results (default 50)
   --no-cache           ignore the on-disk cache and rebuild from scratch
   --embed-provider P   hash (offline, default) | openai (any OpenAI-compatible
-                       endpoint: OpenAI, Ollama, LM Studio, vLLM, ...)
+                       endpoint: OpenAI, Ollama, LM Studio, vLLM, ...) |
+                       cohere (Cohere /embed API: embed-v4.0, embed-*-v3.0)
   --embed-url URL      e.g. http://localhost:11434/v1   (env EMBED_URL)
-  --embed-model M      e.g. text-embedding-3-small, nomic-embed-text (env EMBED_MODEL)
-  --embed-key KEY      API key (env EMBED_API_KEY / OPENAI_API_KEY)
+  --embed-model M      e.g. text-embedding-3-small, embed-v4.0 (env EMBED_MODEL)
+  --embed-key KEY      API key (env EMBED_API_KEY / OPENAI_API_KEY / COHERE_API_KEY)
   --embed-dim N        hash embedding dimensions (default 256)
   --embed-batch N      remote embedding batch size (default 64)
 

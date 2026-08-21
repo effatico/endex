@@ -31,6 +31,11 @@ pub struct FileEntry {
     /// definitions extracted at index time (sorted by line)
     #[serde(default)]
     pub defs: Vec<Def>,
+    /// content hash (fnv64 of the file's text) — explicit invalidation key.
+    /// Two files with identical content share it; a file whose content
+    /// changed gets a new hash even if mtime/len happen to match.
+    #[serde(default)]
+    pub content_hash: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -72,6 +77,7 @@ struct ParsedFile {
     len: u64,
     blocks: Vec<ParsedBlock>,
     defs: Vec<Def>,
+    content_hash: u64,
 }
 
 /// Split text into blank-line-separated blocks (capped at BLOCK_MAX_LINES).
@@ -218,6 +224,7 @@ impl Index {
             return self.remove_file(path);
         }
         let text = String::from_utf8_lossy(&bytes);
+        let content_hash = crate::embed::fnv64(&text);
         let parsed = parse_blocks(&text);
         let defs = graph::extract_defs(&path.to_string_lossy(), &text);
 
@@ -268,6 +275,7 @@ impl Index {
                 len,
                 blocks: block_ids,
                 defs,
+                content_hash,
             },
         );
         true
@@ -315,6 +323,7 @@ impl Index {
                     path: p.clone(),
                     mtime: mtime_of(&meta),
                     len: meta.len(),
+                    content_hash: crate::embed::fnv64(&text),
                     blocks: parse_blocks(&text),
                     defs: graph::extract_defs(&p.to_string_lossy(), &text),
                 })
@@ -351,6 +360,7 @@ impl Index {
                     len: file.len,
                     blocks: ids,
                     defs: file.defs,
+                    content_hash: file.content_hash,
                 },
             );
         }
@@ -411,6 +421,34 @@ impl Index {
             .map(|b| crate::embed::fnv64(&b.text))
             .collect();
         self.embeddings.gc(&live);
+    }
+
+    /// Corpus fingerprint: XOR of all file content hashes, combined with the
+    /// file count. Two indexes of the same tree have the same fingerprint;
+    /// any content change flips it. Used by the cache manifest to detect
+    /// staleness at a glance.
+    pub fn corpus_fingerprint(&self) -> u64 {
+        let mut h = self.files.len() as u64;
+        for e in self.files.values() {
+            h ^= e.content_hash;
+        }
+        h
+    }
+
+    /// Files whose content hash differs from `other` (or that are new) —
+    /// i.e. the unit of a partial cache update.
+    pub fn changed_files_vs(&self, other: &Index) -> Vec<PathBuf> {
+        self.files
+            .iter()
+            .filter(|(p, e)| {
+                other
+                    .files
+                    .get(*p)
+                    .map(|o| o.content_hash != e.content_hash)
+                    .unwrap_or(true)
+            })
+            .map(|(p, _)| p.clone())
+            .collect()
     }
 }
 
