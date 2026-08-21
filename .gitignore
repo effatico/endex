@@ -3,9 +3,6 @@
 debug
 release
 
-# Index caches produced by the tool itself
-.endex-index.bin
-
 # Rust toolchain files
 rust-toolchain
 rust-toolchain.toml

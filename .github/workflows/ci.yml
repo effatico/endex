@@ -36,3 +36,6 @@ jobs:
 
       - name: Run tests
         run: cargo test --release
+
+      - name: Test pi extension client
+        run: EMBED_PROVIDER=hash ENDEX_BIN=./target/release/endex node extensions/test-client.mjs

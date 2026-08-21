@@ -28,7 +28,7 @@ brew install effatico/endex/endex
 
 ## Use with your AI assistant
 
-endex runs as an MCP server (`endex mcp [DIR]`) exposing seven tools — search, ask, graph, flow, clues, index, status — with an always-on watcher and background embedder.
+endex runs as an MCP server (`endex mcp [DIR]`) exposing seven tools — search, ask, graph, flow, clues, index, stats — with an always-on watcher and background embedder.
 
 - **pi** (zero-config native extension — spawns and manages the server for you):
   ```bash

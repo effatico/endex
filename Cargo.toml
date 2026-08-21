@@ -1,6 +1,6 @@
 [package]
 name = "endex"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "Extremely fast, cached, self-updating code indexer with millisecond substring search"
 license = "MIT"
@@ -29,4 +29,5 @@ ureq = { version = "2", features = ["json"] }
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
+# NOTE: no panic = "abort" — the MCP server is long-lived and tool calls are
+# wrapped in catch_unwind; an aborting panic would take down the session.

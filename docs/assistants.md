@@ -14,9 +14,9 @@ The server is **always-on and low-latency**: a background watcher reindexes chan
 | `endex_flow` | Call paths A→B with file:line hops plus the source block of every hop |
 | `endex_clues` | Blocks mentioning a term, annotated with the symbols defined in them |
 | `endex_index` | Build/refresh the index (rarely needed — the server self-refreshes) |
-| `endex_status` | Index stats: files / blocks / symbols / edges / vectors / coverage |
+| `endex_stats` | Index stats: files / blocks / symbols / edges / vectors / coverage |
 
-Every tool takes an optional `dir`; without it, the directory the server was started with is used.
+Tools always operate on the directory the server was started with — one server per repo (start additional `endex mcp` instances for other directories).
 
 ## Claude Code
 
@@ -89,7 +89,7 @@ Requirements: the `endex` binary on PATH (or set `ENDEX_BIN=/path/to/endex`). Em
 
 Handy commands inside pi:
 
-- `/endex status` — files / blocks / symbols / vectors / semantic coverage
+- `/endex stats` — files / blocks / symbols / vectors / semantic coverage
 - `/endex restart` — kill the server (it respawns on the next tool call)
 
 The extension auto-starts the server on the first tool call and stops it when the pi session ends. Development / quick test without installing:

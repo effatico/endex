@@ -11,7 +11,7 @@
 class Endex < Formula
   desc "Fast cached code indexer with MCP server for AI coding assistants"
   homepage "https://github.com/effatico/endex"
-  version "0.1.2"
+  version "0.2.0"
   license "MIT"
 
   on_macos do
@@ -55,8 +55,10 @@ class Endex < Formula
   end
 
   test do
-    # The binary should respond to an MCP initialize handshake on stdio.
-    output = pipe_output(bin/"endex", %Q[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n mcp .\n], 5)
-    assert_match "endex", output
+    # The binary must answer an MCP initialize handshake on stdio when
+    # invoked as `endex mcp DIR` (previously this only matched usage text).
+    input = %({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n)
+    output = pipe_output("#{bin}/endex mcp .", input, 10)
+    assert_match '"serverInfo"', output
   end
 end
