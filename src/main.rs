@@ -57,9 +57,10 @@ REPL (watch mode):
   :clues TERM      blocks + symbols        :embed    build/refresh embeddings
   :limit N  :save  :stats  :quit
 
-The cache is stored as .endex-index.bin (plus .endex-manifest.json) inside
-  the indexed directory. The watcher and full walks always honor .gitignore;
-  hidden (dot) files and the cache files themselves are never indexed."
+The cache is stored under ~/.endex/cache/<repo_name> (one 'index.bin' plus a
+  'manifest.json' per project). The watcher and full walks always honor
+  .gitignore; hidden (dot) files and the cache files themselves are never
+  indexed."
     );
     std::process::exit(code);
 }

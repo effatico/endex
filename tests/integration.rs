@@ -193,9 +193,12 @@ fn cache_round_trip_preserves_search_results() {
 #[test]
 fn cache_rejects_garbage() {
     let tmp = TempDir::new();
-    let p = tmp.path().join(".endex-index.bin");
+    let p = store::cache_path(tmp.path());
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
     fs::write(&p, b"not a valid cache").unwrap();
     assert!(store::load(tmp.path()).is_none());
+    // Clean up: the cache lives in ~/.endex/cache now, not in the temp dir.
+    fs::remove_file(&p).ok();
 }
 
 // ---------- ranking ----------

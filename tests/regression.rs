@@ -123,8 +123,8 @@ fn ignores_skip_gitignored_hidden_and_self_written_files() {
     assert!(ig.is_ignored(&tmp.path().join("target"), true));
     assert!(ig.is_ignored(&tmp.path().join(".env"), false));
     assert!(ig.is_ignored(&tmp.path().join(".git/HEAD"), false));
-    assert!(ig.is_ignored(&tmp.path().join(".endex-index.bin"), false));
-    assert!(ig.is_ignored(&tmp.path().join(".endex-manifest.json"), false));
+    assert!(ig.is_ignored(&tmp.path().join("index.bin"), false));
+    assert!(ig.is_ignored(&tmp.path().join("manifest.json"), false));
     assert!(!ig.is_ignored(&tmp.path().join("src/main.rs"), false));
     assert!(!ig.is_ignored(&tmp.path().join("a.txt"), false));
 }

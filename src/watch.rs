@@ -114,11 +114,19 @@ impl Ignores {
     /// pass false when unsure — directory patterns are also matched against
     /// parent components.
     pub fn is_ignored(&mut self, path: &Path, is_dir: bool) -> bool {
+        // Cache/manifest files of another indexed project (or our fallback
+        // cache dir) must never enter the index — mirrors the filter
+        // `index::walk_files` applies on full walks.
+        if let Some(name) = path.file_name() {
+            if crate::store::SELF_WRITTEN.contains(&name.to_string_lossy().as_ref()) {
+                return true;
+            }
+        }
         let rel = match path.strip_prefix(&self.root) {
             Ok(r) => r,
             Err(_) => return false,
         };
-        // Hidden components (covers .git, .env, .endex-* and any dot-dir).
+        // Hidden components (covers .git, .env and any dot-dir).
         for c in rel.components() {
             if let std::path::Component::Normal(os) = c {
                 if os.to_string_lossy().starts_with('.') {

@@ -69,7 +69,7 @@ Switching `EMBED_MODEL` between LiteLLM aliases is safe: endex's manifest detect
 
 ## Caching behavior
 
-Vectors are keyed by content hash (fnv64 of block text) and persisted in `.endex-index.bin`; `.endex-manifest.json` records the provider identity and corpus fingerprint. Consequences:
+Vectors are keyed by content hash (fnv64 of block text) and persisted in `~/.endex/cache/<repo_name>/index.bin`; the `manifest.json` alongside it records the provider identity and corpus fingerprint. Consequences:
 
 - Restarting the server reuses all vectors (zero re-embedding).
 - Editing a file only re-embeds the blocks that changed; moved code keeps its vectors.

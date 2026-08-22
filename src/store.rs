@@ -1,13 +1,18 @@
 //! Disk cache: bincode-serialized index with a magic header, written
 //! atomically (tmp file + rename) so a crash never corrupts the cache.
 //!
-//! Alongside the index we keep a tiny JSON *manifest* (`.endex-manifest.json`)
+//! Alongside the index we keep a tiny JSON *manifest* (`manifest.json`)
 //! recording the embedding provider and the corpus fingerprint. On load we
 //! can then cheaply answer: is this cache for the same provider? is it
 //! fresh for the current tree? — without deserializing the full index.
+//!
+//! Caches live in `~/.endex/cache/<repo_name>-<hash_of_project_path>/`
+//! (falling back to the project dir itself when there is no home dir), so
+//! indexed project directories stay clean.
 
 use crate::index::Index;
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -17,13 +22,15 @@ const MAGIC: &[u8; 10] = b"ENDEXIDX\x04\x00"; // v4: + per-block content hash
 /// Cache format version of the current MAGIC header (bumped on schema change).
 pub const CACHE_VERSION: u32 = 4;
 
-/// Files the tool itself writes into the indexed directory. Watchers and
-/// walkers must ignore them or the index re-ingests its own output forever.
+/// Filenames the tool writes into its cache directory (`~/.endex/cache/...`).
+/// Watchers and walkers must ignore these names or the index re-ingests its
+/// own output forever (relevant when the cache falls back into the project
+/// dir, or when the project dir is a cache dir).
 pub const SELF_WRITTEN: &[&str] = &[
-    ".endex-index.bin",
-    ".endex-index.tmp",
-    ".endex-manifest.json",
-    ".endex-manifest.tmp",
+    "index.bin",
+    "index.bin.tmp",
+    "manifest.json",
+    "manifest.json.tmp",
 ];
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -39,16 +46,53 @@ pub struct Manifest {
     pub embedding_dim: usize,
 }
 
+/// Directory that holds this project's cache files:
+/// `~/.endex/cache/<repo_name>-<hash_of_project_path>` (falls back to the
+/// project dir itself when there is no home directory). The hash suffix
+/// keeps two different projects with the same directory name apart.
+fn cache_dir(root: &Path) -> std::path::PathBuf {
+    let home = env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(std::path::PathBuf::from));
+    let Some(home) = home else {
+        return root.to_path_buf();
+    };
+    let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let name = canon
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "root".into());
+    // Sanitize: filename chars are safe to use as-is in a path component.
+    let name: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let hash = crate::embed::fnv64(&canon.to_string_lossy());
+    home.join(".endex")
+        .join("cache")
+        .join(format!("{name}-{hash:016x}"))
+}
+
 pub fn cache_path(root: &Path) -> std::path::PathBuf {
-    root.join(".endex-index.bin")
+    cache_dir(root).join("index.bin")
 }
 
 pub fn manifest_path(root: &Path) -> std::path::PathBuf {
-    root.join(".endex-manifest.json")
+    cache_dir(root).join("manifest.json")
 }
 
 pub fn save(index: &Index, root: &Path) -> io::Result<()> {
     let path = cache_path(root);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
     let t0 = std::time::Instant::now();
     let mut data = bincode::serialize(index).map_err(io::Error::other)?;
     let mut buf = Vec::with_capacity(data.len() + MAGIC.len());

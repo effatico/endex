@@ -6,7 +6,7 @@ Three layers, all cached on disk and updated incrementally:
 
 1. **Trigram inverted index** (the approach behind Google Code Search / Zoekt): every 3-byte window of the corpus maps to a posting list of *block ids*. Queries intersect posting lists and verify a tiny candidate set — arbitrary substring search runs in **microseconds to a few milliseconds** even on huge corpora.
 2. **Knowledge graph**: symbols (functions, methods, classes, ...) and **call edges**, plus file-level **import edges**, extracted heuristically per language (Rust, TS/JS, Python, Go, Java/C#/Kotlin). Powers `graph` (who calls whom), `flow` (call paths between two symbols) and `clues` (blocks mentioning a term + their symbols).
-3. **Embeddings**: every block gets a semantic vector, fused with lexical ranking via reciprocal rank fusion (`ask`). Vectors are keyed by content hash and persisted in `.endex-index.bin`, so edits only re-embed changed blocks and restarts are instant.
+3. **Embeddings**: every block gets a semantic vector, fused with lexical ranking via reciprocal rank fusion (`ask`). Vectors are keyed by content hash and persisted in the on-disk cache (`~/.endex/cache/<repo_name>/index.bin`), so edits only re-embed changed blocks and restarts are instant.
 
 Code is chunked into blank-line-separated **blocks** (max 80 lines), so results are meaningful units (functions, paragraphs, config sections). Case-insensitive, gitignore-aware, skips binaries and files > 5 MB, parallel via `rayon`.
 
