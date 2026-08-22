@@ -1,14 +1,17 @@
 //! Semantic embeddings with pluggable providers, plus hybrid (lexical +
-//! semantic) search via reciprocal rank fusion.
+//! semantic) search via reciprocal rank fusion and optional reranking.
 //!
 //! Providers:
+//! - `cohere` (default) — Cohere `/embed` (v2): asymmetric search_document/
+//!   search_query embeddings, plus the `/rerank` endpoint which reorders
+//!   the fused candidates of every `ask` query. Needs COHERE_API_KEY.
+//! - `openai` — any OpenAI-compatible `/embeddings` endpoint: OpenAI,
+//!   Ollama (`http://localhost:11434/v1`), LM Studio, vLLM, ...
 //! - `hash`   — deterministic feature-hashing embedding, fully offline.
 //!   Gives fuzzy lexical matching (typos, word variants) with zero
 //!   dependencies and instant speed. Not truly semantic.
-//! - `openai` — any OpenAI-compatible `/embeddings` endpoint: OpenAI,
-//!   Ollama (`http://localhost:11434/v1`), LM Studio, vLLM, ...
-//!   This is where real semantic search comes from, local or remote.
 //!
+//! Only Cohere is actively maintained; the others remain as fallbacks.
 //! Embeddings are cached in the index by content hash, so file edits only
 //! re-embed changed blocks and moved code keeps its vectors.
 
@@ -88,6 +91,9 @@ pub struct Provider {
     pub key: String,
     pub batch: usize,
     pub dim: usize,
+    /// Cohere rerank model ("rerank-v3.5"); empty when the provider has
+    /// no reranking endpoint (all non-Cohere providers).
+    pub rerank_model: String,
 }
 
 /// Options for `Provider::resolve`. Every field is optional; anything unset
@@ -100,19 +106,21 @@ pub struct ProviderOpts {
     pub key: Option<String>,
     pub dim: Option<usize>,
     pub batch: Option<usize>,
+    pub rerank_model: Option<String>,
 }
 
 impl Provider {
     /// Resolve provider settings from CLI options with env-var fallbacks:
-    /// EMBED_PROVIDER, EMBED_URL, EMBED_MODEL, EMBED_API_KEY / OPENAI_API_KEY,
-    /// EMBED_DIM, EMBED_BATCH.
+    /// EMBED_PROVIDER, EMBED_URL, EMBED_MODEL, EMBED_API_KEY /
+    /// COHERE_API_KEY / OPENAI_API_KEY, EMBED_DIM, EMBED_BATCH,
+    /// EMBED_RERANK_MODEL. The default provider is Cohere.
     pub fn resolve(opts: &ProviderOpts) -> Provider {
         let env = |name: &str| std::env::var(name).ok().filter(|s| !s.is_empty());
         let name = opts
             .provider
             .clone()
             .or_else(|| env("EMBED_PROVIDER"))
-            .unwrap_or_else(|| "hash".into());
+            .unwrap_or_else(|| "cohere".into());
         match name.as_str() {
             "cohere" => Provider {
                 kind: ProviderKind::Cohere,
@@ -137,6 +145,11 @@ impl Provider {
                     .or_else(|| env("EMBED_BATCH").and_then(|s| s.parse().ok()))
                     .unwrap_or(96), // Cohere's per-request limit
                 dim: 0,
+                rerank_model: opts
+                    .rerank_model
+                    .clone()
+                    .or_else(|| env("EMBED_RERANK_MODEL"))
+                    .unwrap_or_else(|| "rerank-v3.5".into()),
             },
             "openai" | "http" | "remote" => Provider {
                 kind: ProviderKind::Http,
@@ -161,6 +174,7 @@ impl Provider {
                     .or_else(|| env("EMBED_BATCH").and_then(|s| s.parse().ok()))
                     .unwrap_or(64),
                 dim: 0,
+                rerank_model: String::new(),
             },
             _ => Provider {
                 kind: ProviderKind::Hash,
@@ -175,6 +189,7 @@ impl Provider {
                     .dim
                     .or_else(|| env("EMBED_DIM").and_then(|s| s.parse().ok()))
                     .unwrap_or(256),
+                rerank_model: String::new(),
             },
         }
     }
@@ -187,6 +202,67 @@ impl Provider {
             ProviderKind::Http => format!("http:{}@{}", self.model, self.url),
             ProviderKind::Cohere => format!("cohere:{}@{}", self.model, self.url),
         }
+    }
+
+    /// Whether this provider can rerank candidate documents. Only Cohere
+    /// exposes a reranking endpoint; other providers keep the hybrid RRF
+    /// order and are not maintained further.
+    pub fn supports_rerank(&self) -> bool {
+        self.kind == ProviderKind::Cohere && !self.rerank_model.is_empty()
+    }
+
+    /// Rerank `docs` against `query`, returning `(doc_index, relevance)`
+    /// pairs sorted best-first. Returns None when the provider has no
+    /// reranker or the call fails — reranking is a quality upgrade, never
+    /// a hard dependency (the caller keeps the RRF order on None).
+    pub fn rerank(&self, query: &str, docs: &[&str]) -> Option<Vec<(usize, f32)>> {
+        if !self.supports_rerank() || docs.is_empty() {
+            return None;
+        }
+        match self.cohere_rerank(query, docs) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("rerank failed ({e}); keeping hybrid order");
+                None
+            }
+        }
+    }
+
+    /// Cohere `/rerank` (v2): query + documents -> per-document relevance
+    /// scores. One request reranks the whole candidate pool.
+    fn cohere_rerank(&self, query: &str, docs: &[&str]) -> Result<Vec<(usize, f32)>, String> {
+        #[derive(Deserialize)]
+        struct RerankResp {
+            results: Vec<RerankResult>,
+        }
+        #[derive(Deserialize)]
+        struct RerankResult {
+            index: usize,
+            relevance_score: f32,
+        }
+        let mut req = ureq::post(&format!("{}/rerank", self.url));
+        if !self.key.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {}", self.key));
+        }
+        let resp = req
+            .timeout(Duration::from_secs(60))
+            .send_json(json!({
+                "model": self.rerank_model,
+                "query": query,
+                "documents": docs,
+                "top_n": docs.len(),
+            }))
+            .map_err(|e| format!("cohere rerank request failed: {e}"))?;
+        let mut scored: Vec<(usize, f32)> = resp
+            .into_json::<RerankResp>()
+            .map_err(|e| format!("bad cohere rerank response: {e}"))?
+            .results
+            .into_iter()
+            .filter(|r| r.index < docs.len())
+            .map(|r| (r.index, r.relevance_score))
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        Ok(scored)
     }
 
     /// Embed a batch of documents (code blocks).
@@ -433,8 +509,77 @@ pub fn top_k(index: &Index, emb: &Embeddings, q: &[f32], k: usize) -> Vec<(f32, 
     scores
 }
 
+/// Result of the full `ask` path.
+pub struct AskOutcome {
+    /// Fused (and, when the provider supports it, reranked) hits with
+    /// their scores — fused RRF weight or Cohere relevance score.
+    pub hits: Vec<(f32, search::Hit)>,
+    /// Whether new block embeddings were computed (cache should be saved).
+    pub changed: bool,
+    /// Whether the provider's reranker reordered the fused candidates.
+    pub reranked: bool,
+}
+
+/// Candidate pool size fed to the reranker: 4× the requested limit, capped
+/// at 40 — enough headroom for reranking to change the order without
+/// sending a huge document batch. Providers without a reranker get 1×.
+pub fn rerank_pool(prov: &Provider, limit: usize) -> usize {
+    if !prov.supports_rerank() || limit >= 40 {
+        return limit;
+    }
+    (limit * 4).min(40)
+}
+
+/// Cap per candidate text before sending it to the reranker: beyond this
+/// the API truncates anyway; smaller requests are cheaper and faster.
+const RERANK_DOC_CHARS: usize = 4000;
+
+/// Rerank fused candidates against the query, truncating to `limit`.
+/// Falls back to the original RRF order when the provider has no reranker
+/// or the call fails — reranking must never fail a query. Returns
+/// `(hits, reranked)`.
+pub fn rerank_fused(
+    prov: &Provider,
+    mut fused: Vec<(f32, search::Hit)>,
+    query: &str,
+    limit: usize,
+) -> (Vec<(f32, search::Hit)>, bool) {
+    if !prov.supports_rerank() || fused.len() <= limit {
+        fused.truncate(limit);
+        return (fused, false);
+    }
+    let docs: Vec<String> = fused
+        .iter()
+        .map(|(_, h)| h.text.chars().take(RERANK_DOC_CHARS).collect())
+        .collect();
+    let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+    match prov.rerank(query, &refs) {
+        Some(order) if !order.is_empty() => {
+            // Move hits out of the fused vector (Hit is not Clone).
+            let mut slots: Vec<Option<(f32, search::Hit)>> =
+                fused.into_iter().map(Some).collect();
+            let out: Vec<(f32, search::Hit)> = order
+                .into_iter()
+                .take(limit)
+                .filter_map(|(i, score)| {
+                    slots
+                        .get_mut(i)
+                        .and_then(Option::take)
+                        .map(|(_, h)| (score, h))
+                })
+                .collect();
+            (out, true)
+        }
+        _ => {
+            fused.truncate(limit);
+            (fused, false)
+        }
+    }
+}
+
 /// Hybrid search: fuse lexical (trigram) and semantic rankings with
-/// reciprocal rank fusion. Returns hits with their fused score.
+/// reciprocal rank fusion, then rerank the fused candidates with the
+/// provider's reranker when it has one (Cohere).
 ///
 /// NOTE: this embeds every missing block inline before answering — fine for
 /// the CLI where the user expects to wait once, but too slow for latency-
@@ -445,18 +590,27 @@ pub fn ask(
     prov: &Provider,
     query: &str,
     limit: usize,
-) -> Result<(Vec<(f32, search::Hit)>, bool), String> {
+) -> Result<AskOutcome, String> {
     let before = idx.embeddings.map.len();
+    let pool = rerank_pool(prov, limit);
     let mut emb = std::mem::take(&mut idx.embeddings);
     let result = (|| -> Result<Vec<(f32, search::Hit)>, String> {
         ensure(&mut emb, prov, idx, true)?;
         let qv = prov.embed_query(query)?;
         let sem = top_k(idx, &emb, &qv, 200);
         let lex = search::search(idx, query, 200);
-        Ok(fuse(idx, &lex, &sem, query, limit))
+        Ok(fuse(idx, &lex, &sem, query, pool))
     })();
     idx.embeddings = emb;
-    result.map(|hits| (hits, idx.embeddings.map.len() != before))
+    let changed = idx.embeddings.map.len() != before;
+    result.map(|fused| {
+        let (hits, reranked) = rerank_fused(prov, fused, query, limit);
+        AskOutcome {
+            hits,
+            changed,
+            reranked,
+        }
+    })
 }
 
 /// Low-latency hybrid search: NEVER embeds the corpus inline. Uses whatever

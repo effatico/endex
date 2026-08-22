@@ -30,6 +30,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Guard: refuse to release when the tag and Cargo.toml disagree, so a
+      # mislabeled tag can never ship binaries reporting the wrong version.
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          PKG=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          TAG=${GITHUB_REF_NAME#v}
+          echo "tag=$TAG cargo=$PKG"
+          [[ "$PKG" == "$TAG" ]] || { echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $PKG"; exit 1; }
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

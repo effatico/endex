@@ -117,7 +117,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "endex_ask",
-            "description": "Semantic search over the codebase in NATURAL LANGUAGE — use this whenever you do not know the exact identifier: 'how do we handle retries', 'where is rate limiting enforced', 'authentication middleware'. STRONGLY PREFER this as the FIRST step when exploring an unfamiliar codebase or concept, instead of guessing grep patterns. Each hit includes the full code block text, so follow-up file reads are rarely needed. Combines lexical + embedding similarity (vectors are kept warm by a background embedder; if coverage < 1.0 the index is still warming up and results are lexical-leaning — retry shortly).",
+            "description": "Semantic search over the codebase in NATURAL LANGUAGE — use this whenever you do not know the exact identifier: 'how do we handle retries', 'where is rate limiting enforced', 'authentication middleware'. STRONGLY PREFER this as the FIRST step when exploring an unfamiliar codebase or concept, instead of guessing grep patterns. Each hit includes the full code block text, so follow-up file reads are rarely needed. Results are reranked for relevance when the provider supports it; vectors are kept warm by a background embedder (if coverage < 1.0 the index is still warming up and results are lexical-leaning — retry shortly).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -198,7 +198,8 @@ fn meta(sh: &Shared, payload: Value, duration_ms: f64) -> Value {
     let mut m = json!({
         "meta": {
             "data": payload,
-            "duration_ms": format!("{duration_ms:.2}"),
+            // Numeric, rounded to 2 decimals: compact and machine-readable.
+            "duration_ms": (duration_ms * 100.0).round() / 100.0,
             "cache_version": store::CACHE_VERSION,
         }
     });
@@ -229,6 +230,11 @@ fn stats_payload(sh: &Shared, emb: &Embeddings, provider: &Provider) -> Value {
         },
         "embeddings": {
             "provider": provider.id(),
+            "rerank_model": if provider.supports_rerank() {
+                json!(provider.rerank_model)
+            } else {
+                Value::Null
+            },
             "vectors": emb.map.len(),
             "dim": emb.dim,
             "coverage": coverage(idx, emb),
@@ -336,6 +342,12 @@ fn arg_usize(args: &Value, key: &str, default: usize) -> usize {
 
 fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+
+/// Round a score to 4 decimals as f64: compact, LLM-friendly output
+/// without f32 rendering noise in JSON.
+fn round_score(x: f32) -> f64 {
+    (x as f64 * 1e4).round() / 1e4
 }
 
 fn resolve_symbol(idx: &Index, g: &Graph, id: u32) -> Value {
@@ -460,67 +472,102 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
                 _ => return tool_err("missing required argument: query"),
             };
             let limit = arg_usize(args, "limit", 20).min(100);
-            // Embed the query BEFORE taking any lock: this HTTP round-trip
-            // must never block the watcher, the embedder, or other tools.
+            // 1. Embed the query BEFORE taking any lock: this HTTP
+            //    round-trip must never block the watcher, the embedder,
+            //    or other tools.
             let qv = provider.embed_query(query);
+            let pool = embed::rerank_pool(provider, limit);
+            // 2. Fuse lexical + semantic rankings into a candidate pool
+            //    sized for the reranker (locks held only for in-memory
+            //    scoring; the Hit text is owned, guards drop here).
+            let (fused, cov, warn) = {
+                let sh_arc = shared();
+                let sh = mlock(&sh_arc);
+                let idx = &sh.idx;
+                let emb_arc = emb();
+                let emb = rlock(&emb_arc);
+                match &qv {
+                    Ok(qv) => {
+                        let (hits, cov) =
+                            embed::ask_fast_with_qv(idx, &emb, qv, query, pool);
+                        (hits, cov, None)
+                    }
+                    Err(e) => (
+                        // Provider unreachable: degrade to lexical, say so.
+                        search::search(idx, query, limit)
+                            .into_iter()
+                            .map(|h| (0.0f32, h))
+                            .collect(),
+                        0.0,
+                        Some(format!(
+                            "semantic provider unavailable ({e}); results are lexical only"
+                        )),
+                    ),
+                }
+            };
+            // 3. Rerank with NO locks held (outside HTTP call). Skipped
+            //    when the embedding call already failed; internally a
+            //    no-op for providers without a reranker.
+            let (hits, reranked) = if warn.is_some() {
+                (fused, false)
+            } else {
+                embed::rerank_fused(provider, fused, query, limit)
+            };
+            // 4. Brief lock to enrich hits with file paths and the symbols
+            //    defined in each block: symbol names are ideal follow-up
+            //    inputs for endex_graph / endex_flow.
             let sh_arc = shared();
             let sh = mlock(&sh_arc);
             let idx = &sh.idx;
-            // Read guard, NOT a clone: scoring only needs &Embeddings.
-            let emb_arc = emb();
-            let emb = rlock(&emb_arc);
-            // ask_fast embeds ONLY the query, never the corpus. The
-            // background embedder keeps block vectors warm; coverage tells
-            // the caller how semantic the current results are.
-            match qv.map(|qv| embed::ask_fast_with_qv(idx, &emb, &qv, query, limit)) {
-                Ok((hits, cov)) => {
-                    let out: Vec<Value> = hits
-                        .iter()
-                        .map(|(score, h)| {
-                            json!({
-                                "file": idx.path_of(h.file_id),
-                                "line": h.line,
-                                "score": score,
-                                "text": h.text,
-                            })
+            let g = &idx.graph;
+            let out: Vec<Value> = hits
+                .iter()
+                .map(|(score, h)| {
+                    let syms: Vec<Value> = g
+                        .by_block
+                        .get(&h.block_id)
+                        .map(|ids| {
+                            ids.iter()
+                                .take(8)
+                                .map(|&id| {
+                                    let s = &g.symbols[id as usize];
+                                    json!({ "name": s.name, "kind": s.kind.label() })
+                                })
+                                .collect()
                         })
-                        .collect();
-                    let payload = json!({
-                        "query": query,
-                        "provider": provider.id(),
-                        "semantic_coverage": cov,
-                        "warming_up": cov < 0.95,
-                        "count": hits.len(),
-                        "hits": out
-                    });
-                    let m = meta(&sh, payload, t0.elapsed().as_secs_f64() * 1000.0);
-                    tool_ok(m.to_string())
-                }
-                Err(e) => {
-                    // Provider unreachable: degrade to lexical, say so.
-                    let hits = search::search(idx, query, limit);
-                    let out: Vec<Value> = hits
-                        .iter()
-                        .map(|h| {
-                            json!({
-                                "file": idx.path_of(h.file_id),
-                                "line": h.line,
-                                "occurrences": h.occurrences,
-                                "text": h.text,
-                            })
-                        })
-                        .collect();
-                    let payload = json!({
-                        "query": query,
-                        "warning": format!("semantic provider unavailable ({e}); results are lexical only"),
-                        "semantic_coverage": 0.0,
-                        "count": hits.len(),
-                        "hits": out
-                    });
-                    let m = meta(&sh, payload, t0.elapsed().as_secs_f64() * 1000.0);
-                    tool_ok(m.to_string())
-                }
+                        .unwrap_or_default();
+                    json!({
+                        "file": idx.path_of(h.file_id),
+                        "line": h.line,
+                        "score": round_score(*score),
+                        "symbols": syms,
+                        "text": h.text,
+                    })
+                })
+                .collect();
+            let mut payload = json!({
+                "query": query,
+                "provider": provider.id(),
+                "coverage": (cov * 100.0).round() / 100.0,
+                "ranked_by": if warn.is_some() {
+                    "lexical"
+                } else if reranked {
+                    "rerank"
+                } else {
+                    "rrf"
+                },
+                "count": hits.len(),
+                "hits": out,
+            });
+            // Conditional fields only: keep the default output compact.
+            if let Some(w) = warn {
+                payload["warning"] = json!(w);
             }
+            if cov < 0.95 && payload.get("warning").is_none() {
+                payload["warming_up"] = json!(true);
+            }
+            let m = meta(&sh, payload, t0.elapsed().as_secs_f64() * 1000.0);
+            tool_ok(m.to_string())
         }
 
         "endex_graph" => {
@@ -943,6 +990,15 @@ pub fn run(dir: String, use_cache: bool, provider: Provider) {
     }
     if EMB.set(emb_state).is_err() {
         panic!("embedding state installed exactly once");
+    }
+
+    if provider.kind == embed::ProviderKind::Cohere && provider.key.is_empty() {
+        eprintln!(
+            "endex MCP: Cohere is the default provider but no API key is set \
+             (COHERE_API_KEY / EMBED_API_KEY) — queries degrade to lexical \
+             results until a key is configured; use --embed-provider hash \
+             for fully offline search"
+        );
     }
 
     eprintln!(

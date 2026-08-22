@@ -239,10 +239,12 @@ fn hybrid_search_finds_relevant_blocks() {
 
     // No lexical hit for "invoice payment processing" as a substring, but
     // the fused hash-embedding ranking should surface the invoice block.
-    let (hits, changed) = embed::ask(&mut idx, &prov, "invoice payment processing", 5).unwrap();
-    assert!(changed);
-    assert!(!hits.is_empty());
-    assert!(idx.path_of(hits[0].1.file_id).contains("billing.ts"));
+    let outcome = embed::ask(&mut idx, &prov, "invoice payment processing", 5).unwrap();
+    assert!(outcome.changed);
+    // The hash provider has no reranker, so RRF order is kept.
+    assert!(!outcome.reranked);
+    assert!(!outcome.hits.is_empty());
+    assert!(idx.path_of(outcome.hits[0].1.file_id).contains("billing.ts"));
 
     // Pure lexical search still works independently.
     assert_eq!(search::search(&idx, "processInvoicePayment", 5).len(), 1);

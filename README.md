@@ -26,6 +26,8 @@ brew install effatico/endex/endex
 
 **From source:** `cargo install --git https://github.com/effatico/endex` (or `cargo build --release`).
 
+**Update:** re-run the same install command — it detects the installed version, skips the download when already current, and replaces the binary otherwise (`ENDEX_FORCE=1` to force a reinstall). With Homebrew: `brew upgrade endex`.
+
 ## Use with your AI assistant
 
 endex runs as an MCP server (`endex mcp [DIR]`) exposing seven tools — search, ask, graph, flow, clues, index, stats — with an always-on watcher and background embedder.
@@ -61,7 +63,7 @@ endex mcp ~/my-repo                            # MCP server over stdio
 
 Watch-mode REPL: plain `QUERY` = lexical, `? QUERY` = semantic, plus `:graph N`, `:flow A B`, `:clues T`, `:embed`, `:limit N`, `:save`, `:stats`, `:quit`.
 
-Semantic search config via env: `EMBED_PROVIDER` (`hash` default, `openai`, `cohere`), `EMBED_URL`, `EMBED_MODEL`, `EMBED_API_KEY`.
+Semantic search config via env: `EMBED_PROVIDER` (`cohere` default — embeddings + reranking; `openai`, `hash` as fallbacks), `EMBED_URL`, `EMBED_MODEL`, `EMBED_API_KEY` (or `COHERE_API_KEY`), `EMBED_RERANK_MODEL` (default `rerank-v3.5`).
 
 ## Performance (measured on this machine)
 
@@ -83,7 +85,7 @@ src/
 ├── main.rs    CLI + interactive watch/REPL loop + hit rendering
 ├── index.rs   trigram index: block parsing, incremental add/remove, parallel build
 ├── graph.rs   knowledge graph: symbol/def extraction, call edges, import resolution, path queries
-├── embed.rs   embedding providers (hash / OpenAI-compatible / Cohere), content-hash vector cache, RRF fusion
+├── embed.rs   embedding providers (Cohere default / OpenAI-compatible / hash), content-hash vector cache, RRF fusion + reranking
 ├── search.rs  posting-list intersection + parallel verification, ranking
 ├── store.rs   atomic bincode cache + JSON manifest (provider id, corpus fingerprint)
 ├── mcp.rs     MCP stdio server: JSON-RPC loop, watcher + background embedder, tool handlers

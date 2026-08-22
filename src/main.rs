@@ -40,14 +40,16 @@ USAGE:
 OPTIONS:
   --limit N            max results (default 50)
   --no-cache           ignore the on-disk cache and rebuild from scratch
-  --embed-provider P   hash (offline, default) | openai (any OpenAI-compatible
-                       endpoint: OpenAI, Ollama, LM Studio, vLLM, ...) |
-                       cohere (Cohere /embed API: embed-v4.0, embed-*-v3.0)
+  --embed-provider P   cohere (default: Cohere /embed API + /rerank reranking)
+                       | openai (any OpenAI-compatible endpoint: OpenAI,
+                       Ollama, LM Studio, vLLM, ...) | hash (fully offline)
   --embed-url URL      e.g. http://localhost:11434/v1   (env EMBED_URL)
-  --embed-model M      e.g. text-embedding-3-small, embed-v4.0 (env EMBED_MODEL)
-  --embed-key KEY      API key (env EMBED_API_KEY / OPENAI_API_KEY / COHERE_API_KEY)
+  --embed-model M      e.g. embed-v4.0, text-embedding-3-small (env EMBED_MODEL)
+  --embed-key KEY      API key (env EMBED_API_KEY / COHERE_API_KEY / OPENAI_API_KEY)
   --embed-dim N        hash embedding dimensions (default 256)
   --embed-batch N      remote embedding batch size (default 64)
+  --embed-rerank-model M  Cohere rerank model (default rerank-v3.5,
+                       env EMBED_RERANK_MODEL; cohere provider only)
 
 REPL (watch mode):
   QUERY            lexical search          ? QUERY   hybrid semantic search
@@ -95,6 +97,7 @@ fn parse_opts(args: &[String]) -> Opts {
             }
             "--no-cache" => opts.use_cache = false,
             "--embed-provider" => opts.embed.provider = next(&mut i),
+            "--embed-rerank-model" => opts.embed.rerank_model = next(&mut i),
             "--embed-model" => opts.embed.model = next(&mut i),
             "--embed-url" => opts.embed.url = next(&mut i),
             "--embed-key" => opts.embed.key = next(&mut i),
@@ -208,16 +211,17 @@ fn cmd_ask(args: &[String]) {
     let prov = provider_from(&opts);
     let t = Instant::now();
     match embed::ask(&mut idx, &prov, &query, opts.limit) {
-        Ok((hits, changed)) => {
+        Ok(outcome) => {
             let dt = t.elapsed();
             println!(
-                "\x1b[1m{}\x1b[0m block(s) matched in \x1b[1m{:.2?}\x1b[0m (hybrid: lexical + semantic, {})",
-                hits.len(),
+                "\x1b[1m{}\x1b[0m block(s) matched in \x1b[1m{:.2?}\x1b[0m (hybrid: lexical + semantic{}, {})",
+                outcome.hits.len(),
                 dt,
+                if outcome.reranked { " + rerank" } else { "" },
                 prov.id()
             );
-            output::print_ask_hits(&idx, &hits, &query);
-            if changed {
+            output::print_ask_hits(&idx, &outcome.hits, &query);
+            if outcome.changed {
                 let _ = store::save(&idx, &root);
             }
         }
@@ -624,15 +628,16 @@ Commands: :graph N  :flow A B  :clues T  :embed [provider]  :limit N  :save  :st
                         } else {
                             let t = Instant::now();
                             match embed::ask(&mut idx, &prov, &q, limit) {
-                                Ok((hits, changed)) => {
-                                    dirty |= changed;
+                                Ok(outcome) => {
+                                    dirty |= outcome.changed;
                                     println!(
-                                        "\x1b[1m{}\x1b[0m block(s) matched in \x1b[1m{:.2?}\x1b[0m (hybrid, {})",
-                                        hits.len(),
+                                        "\x1b[1m{}\x1b[0m block(s) matched in \x1b[1m{:.2?}\x1b[0m (hybrid{}, {})",
+                                        outcome.hits.len(),
                                         t.elapsed(),
+                                        if outcome.reranked { " + rerank" } else { "" },
                                         prov.id()
                                     );
-                                    output::print_ask_hits(&idx, &hits, &q);
+                                    output::print_ask_hits(&idx, &outcome.hits, &q);
                                 }
                                 Err(e) => {
                                     eprintln!("semantic search failed: {e}");

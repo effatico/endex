@@ -6,6 +6,11 @@
 # Options (env vars):
 #   ENDEX_VERSION   tag to install (default: latest)
 #   ENDEX_PREFIX    install dir     (default: /usr/local/bin, or ~/.local/bin without sudo)
+#   ENDEX_FORCE     set to 1 to reinstall even when already up to date
+#
+# The same command also UPDATES an existing installation: the script detects
+# the installed version, skips the download when already current, and
+# atomically replaces the binary otherwise.
 set -eu
 
 REPO="effatico/endex"
@@ -45,7 +50,38 @@ else
     || fail "could not determine latest release"
 fi
 [ -n "$VERSION" ] || fail "no release found"
-say "Installing endex $VERSION ($TARGET)..."
+
+# Pick an install dir.
+if [ "${ENDEX_PREFIX:-}" ]; then
+  DEST="$ENDEX_PREFIX"
+elif [ -w /usr/local/bin ]; then
+  DEST="/usr/local/bin"
+elif command -v sudo >/dev/null 2>&1; then
+  DEST="/usr/local/bin"
+else
+  DEST="$HOME/.local/bin"
+fi
+
+# Detect an existing installation (old binaries predate --version and are
+# treated as "unknown" so they always get updated).
+CURRENT=""
+if [ -x "$DEST/$BIN" ]; then
+  CURRENT=$("$DEST/$BIN" --version 2>/dev/null \
+    | grep -E '^endex [0-9]+\.[0-9]+\.[0-9]+' | head -1 | awk '{print $2}' || true)
+fi
+
+if [ -n "$CURRENT" ] && [ "v$CURRENT" = "$VERSION" ] && [ "${ENDEX_FORCE:-}" != "1" ]; then
+  say "endex $CURRENT is already installed at $DEST/$BIN (up to date; ENDEX_FORCE=1 to reinstall)"
+  exit 0
+fi
+
+if [ -n "$CURRENT" ]; then
+  say "Updating endex $CURRENT -> ${VERSION#v} ($TARGET)..."
+elif [ -x "$DEST/$BIN" ]; then
+  say "Updating endex (unknown version) -> ${VERSION#v} ($TARGET)..."
+else
+  say "Installing endex ${VERSION#v} ($TARGET)..."
+fi
 
 ASSET="endex-${TARGET}.tar.gz"
 BASE="https://github.com/$REPO/releases/download/$VERSION"
@@ -67,16 +103,6 @@ fi
 
 tar -xzf "$ASSET"
 
-# Pick an install dir.
-if [ "${ENDEX_PREFIX:-}" ]; then
-  DEST="$ENDEX_PREFIX"
-elif [ -w /usr/local/bin ]; then
-  DEST="/usr/local/bin"
-elif command -v sudo >/dev/null 2>&1; then
-  DEST="/usr/local/bin"
-else
-  DEST="$HOME/.local/bin"
-fi
 mkdir -p "$DEST" 2>/dev/null || true
 
 if [ -w "$DEST" ]; then
@@ -87,7 +113,8 @@ else
 fi
 chmod +x "$DEST/$BIN" 2>/dev/null || sudo chmod +x "$DEST/$BIN"
 
-say "endex installed to $DEST/$BIN"
+NEW_VERSION=$("$DEST/$BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+say "endex ${NEW_VERSION:-$VERSION} installed to $DEST/$BIN"
 case ":$PATH:" in
   *":$DEST:"*) : ;;
   *) say "note: $DEST is not on your PATH — add it, e.g.:  export PATH=\"$DEST:\$PATH\"" ;;

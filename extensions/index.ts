@@ -48,10 +48,11 @@ export default function (pi: ExtensionAPI) {
     name: "endex_ask",
     label: "endex ask",
     description:
-      "Semantic search over the codebase in NATURAL LANGUAGE — use this whenever you do not know the exact identifier: 'how do we handle retries', 'where is rate limiting enforced', 'authentication middleware'. STRONGLY PREFER this as the FIRST step when exploring an unfamiliar codebase or concept, instead of guessing grep patterns. Each hit includes the full code block text. Combines lexical + embedding similarity (requires an EMBED_* provider configured for the endex server; check endex_stats).",
-    promptSnippet: "Natural-language semantic search over the codebase",
+      "Semantic search over the codebase in NATURAL LANGUAGE — use this whenever you do not know the exact identifier: 'how do we handle retries', 'where is rate limiting enforced', 'authentication middleware'. STRONGLY PREFER this as the FIRST step when exploring an unfamiliar codebase or concept, instead of guessing grep patterns. Each hit includes the full code block text. Results are reranked for relevance when the provider supports it (check endex_stats).",
+    promptSnippet: "Natural-language semantic search over the codebase, Cohere-reranked",
     promptGuidelines: [
       "Use endex_ask first when exploring an unfamiliar codebase or concept in natural language, instead of guessing grep patterns.",
+      "endex_ask hits include the symbols defined in each block — use those names directly with endex_graph/endex_flow for follow-up navigation.",
     ],
     parameters: Type.Object({
       query: Type.String({ description: "Natural language question or description of the code." }),
