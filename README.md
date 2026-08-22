@@ -6,7 +6,7 @@ Three layers, all cached on disk and updated incrementally:
 
 1. **Trigram inverted index** (the approach behind Google Code Search / Zoekt): every 3-byte window of the corpus maps to a posting list of *block ids*. Queries intersect posting lists and verify a tiny candidate set — arbitrary substring search runs in **microseconds to a few milliseconds** even on huge corpora.
 2. **Knowledge graph**: symbols (functions, methods, classes, ...) and **call edges**, plus file-level **import edges**, extracted heuristically per language (Rust, TS/JS, Python, Go, Java/C#/Kotlin). Powers `graph` (who calls whom), `flow` (call paths between two symbols) and `clues` (blocks mentioning a term + their symbols).
-3. **Embeddings**: every block gets a semantic vector, fused with lexical ranking via reciprocal rank fusion (`ask`). Vectors are keyed by content hash and persisted in the on-disk cache (`~/.endex/cache/<repo_name>/index.bin`), so edits only re-embed changed blocks and restarts are instant.
+3. **Embeddings**: every block gets a semantic vector, fused with lexical ranking via reciprocal rank fusion (`ask`). Vectors are keyed by content hash and persisted in the on-disk cache (`~/.endex/cache/<repo_name>-<hash>/index.bin`, override the root with `ENDEX_CACHE_DIR`), so edits only re-embed changed blocks and restarts are instant.
 
 Code is chunked into blank-line-separated **blocks** (max 80 lines), so results are meaningful units (functions, paragraphs, config sections). Case-insensitive, gitignore-aware, skips binaries and files > 5 MB, parallel via `rayon`.
 
@@ -63,7 +63,7 @@ endex mcp ~/my-repo                            # MCP server over stdio
 
 Watch-mode REPL: plain `QUERY` = lexical, `? QUERY` = semantic, plus `:graph N`, `:flow A B`, `:clues T`, `:embed`, `:limit N`, `:save`, `:stats`, `:quit`.
 
-Semantic search config via env: `EMBED_PROVIDER` (`cohere` default — embeddings + reranking; `openai`, `hash` as fallbacks), `EMBED_URL`, `EMBED_MODEL`, `EMBED_API_KEY` (or `COHERE_API_KEY`), `EMBED_RERANK_MODEL` (default `rerank-v3.5`).
+Semantic search config via env: `EMBED_PROVIDER` (`cohere` default — embeddings + reranking; `openai`, `hash` as fallbacks), `EMBED_URL`, `EMBED_MODEL`, `EMBED_API_KEY` (or `COHERE_API_KEY`), `EMBED_RERANK_MODEL` (default `rerank-v3.5`). Without an API key the implicit Cohere default drops to the offline `hash` provider. Cache location: `ENDEX_CACHE_DIR`.
 
 ## Performance (measured on this machine)
 

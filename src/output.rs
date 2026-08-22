@@ -76,11 +76,15 @@ pub fn print_hits(
     }
 }
 
-pub fn print_ask_hits(idx: &Index, hits: &[(f32, search::Hit)], query: &str) {
+/// `reranked` labels the score column: after reranking these are provider
+/// relevance scores, otherwise RRF fusion weights — different scales, so
+/// say which one the reader is looking at.
+pub fn print_ask_hits(idx: &Index, hits: &[(f32, search::Hit)], query: &str, reranked: bool) {
     let q = query.to_lowercase();
+    let label = if reranked { "relevance" } else { "rrf" };
     for (score, hit) in hits {
         println!(
-            "\x1b[1;36m{}:{}\x1b[0m  \x1b[2mscore {score:.4}\x1b[0m",
+            "\x1b[1;36m{}:{}\x1b[0m  \x1b[2m{label} {score:.4}\x1b[0m",
             idx.path_of(hit.file_id),
             hit.line
         );

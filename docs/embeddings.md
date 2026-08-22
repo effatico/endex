@@ -2,11 +2,11 @@
 
 `endex ask` (and `endex_ask` over MCP) fuses lexical search with embedding similarity via reciprocal rank fusion, then reranks the fused candidates with the Cohere `/rerank` endpoint when the provider supports it. The provider is selected by flag or env var; if it's unreachable, `ask` falls back to lexical search with a warning.
 
-**Cohere is the default provider** and the only actively maintained one; the others remain as fallbacks and receive no further work.
+**Cohere is the default provider** and the only actively maintained one; the others remain as fallbacks and receive no further work. If Cohere is only the *default* (not explicitly requested) and no API key is configured, endex falls back to the offline `hash` provider and prints a note — a default should never send code to a third-party API without an explicit opt-in. Passing `--embed-provider cohere` / `EMBED_PROVIDER=cohere` always uses Cohere and surfaces the missing-key error instead.
 
 | Provider | Flag | Notes |
 |---|---|---|
-| `cohere` (default) | `--embed-provider cohere` | Cohere `/embed` API (`embed-v4.0`, `embed-english-v3.0`, `embed-multilingual-v3.0`). Blocks embed as `search_document`, queries as `search_query` for best retrieval quality. Fused candidates are reranked via Cohere `/rerank` (default model `rerank-v3.5`, override with `--embed-rerank-model` / `EMBED_RERANK_MODEL`). Key via `--embed-key`, `EMBED_API_KEY`, or `COHERE_API_KEY`. Without a key, queries degrade to lexical results until one is configured. |
+| `cohere` (default) | `--embed-provider cohere` | Cohere `/embed` API (`embed-v4.0`, `embed-english-v3.0`, `embed-multilingual-v3.0`). Blocks embed as `search_document`, queries as `search_query` for best retrieval quality. Fused candidates are reranked via Cohere `/rerank` (default model `rerank-v3.5`, override with `--embed-rerank-model` / `EMBED_RERANK_MODEL`). Key via `--embed-key`, `EMBED_API_KEY`, or `COHERE_API_KEY`. Without a key: the implicit default drops to `hash`, an explicit `cohere` degrades to lexical results per query. |
 | `openai` | `--embed-provider openai` | Any OpenAI-compatible `/embeddings` endpoint: OpenAI, **Ollama** (`--embed-url http://localhost:11434/v1`), **LiteLLM proxy** (`--embed-url http://localhost:4000/v1`), LM Studio, vLLM, ... No reranker — hybrid RRF order is kept. |
 | `hash` | `--embed-provider hash` | Deterministic feature-hashing embedding. Fully offline, instant, zero deps. Fuzzy lexical matching (typos, word variants) — not truly semantic. No reranker. |
 
@@ -69,7 +69,7 @@ Switching `EMBED_MODEL` between LiteLLM aliases is safe: endex's manifest detect
 
 ## Caching behavior
 
-Vectors are keyed by content hash (fnv64 of block text) and persisted in `~/.endex/cache/<repo_name>/index.bin`; the `manifest.json` alongside it records the provider identity and corpus fingerprint. Consequences:
+Vectors are keyed by content hash (fnv64 of block text) and persisted in `~/.endex/cache/<repo_name>-<hash>/index.bin` (override the root with `ENDEX_CACHE_DIR`); the `manifest.json` alongside it records the provider identity and corpus fingerprint. Consequences:
 
 - Restarting the server reuses all vectors (zero re-embedding).
 - Editing a file only re-embeds the blocks that changed; moved code keeps its vectors.

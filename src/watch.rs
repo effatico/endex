@@ -64,6 +64,9 @@ pub fn watch(root: &std::path::Path) -> notify::Result<Receiver<Vec<PathBuf>>> {
 /// `.git/info/exclude`. Nested matchers are built lazily and cached.
 pub struct Ignores {
     root: PathBuf,
+    /// This project's cache directory; files we wrote there are never
+    /// indexed. Resolved once (it canonicalizes).
+    cache_dir: PathBuf,
     /// directory -> its .gitignore matcher (None = dir has none)
     matchers: HashMap<PathBuf, Option<Gitignore>>,
     global: Gitignore,
@@ -77,6 +80,7 @@ impl Ignores {
         let (global, _) = Gitignore::global();
         Ignores {
             root: root.to_path_buf(),
+            cache_dir: crate::store::cache_dir(root),
             matchers: HashMap::new(),
             global,
             git_repo: root.join(".git").exists(),
@@ -114,13 +118,11 @@ impl Ignores {
     /// pass false when unsure — directory patterns are also matched against
     /// parent components.
     pub fn is_ignored(&mut self, path: &Path, is_dir: bool) -> bool {
-        // Cache/manifest files of another indexed project (or our fallback
-        // cache dir) must never enter the index — mirrors the filter
-        // `index::walk_files` applies on full walks.
-        if let Some(name) = path.file_name() {
-            if crate::store::SELF_WRITTEN.contains(&name.to_string_lossy().as_ref()) {
-                return true;
-            }
+        // Our own cache artifacts must never enter the index — mirrors the
+        // filter `index::walk_files` applies on full walks. Path-scoped:
+        // a project's own `manifest.json` is a normal indexable file.
+        if crate::store::is_self_written(&self.cache_dir, path) {
+            return true;
         }
         let rel = match path.strip_prefix(&self.root) {
             Ok(r) => r,

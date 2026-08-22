@@ -2,17 +2,26 @@
 //! MCP message framing robustness, watcher ignore rules, and posting-list
 //! consistency under repeated edits.
 
-use endex::{index::Index, mcp, output, search, watch};
+use endex::{index::Index, mcp, output, search, store, watch};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Once;
 
 static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+static CACHE_ENV: Once = Once::new();
 
 struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
+        // Redirect the on-disk cache into the system temp dir: tests must
+        // never write into the developer's real ~/.endex/cache. Set once
+        // per test process, before any store path is resolved.
+        CACHE_ENV.call_once(|| {
+            let d = std::env::temp_dir().join(format!("endex-test-cache-{}", std::process::id()));
+            std::env::set_var("ENDEX_CACHE_DIR", &d);
+        });
         let n = DIR_SEQ.fetch_add(1, Ordering::SeqCst);
         let p = std::env::temp_dir().join(format!(
             "endex-regtest-{}-{}-{}",
@@ -41,10 +50,13 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
+        // Resolve the cache dir BEFORE deleting the project (it canonicalizes
+        // the root), so no cache leaks behind after the test run.
+        let cache = store::cache_dir(&self.0);
+        let _ = fs::remove_dir_all(&cache);
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-
 // ---------- unicode-safe highlighting ----------
 
 #[test]
@@ -123,8 +135,16 @@ fn ignores_skip_gitignored_hidden_and_self_written_files() {
     assert!(ig.is_ignored(&tmp.path().join("target"), true));
     assert!(ig.is_ignored(&tmp.path().join(".env"), false));
     assert!(ig.is_ignored(&tmp.path().join(".git/HEAD"), false));
-    assert!(ig.is_ignored(&tmp.path().join("index.bin"), false));
-    assert!(ig.is_ignored(&tmp.path().join("manifest.json"), false));
+    // Our own artifacts, but only inside the cache dir.
+    let cache = store::cache_dir(tmp.path());
+    assert!(ig.is_ignored(&cache.join("index.bin"), false));
+    assert!(ig.is_ignored(&cache.join("manifest.json"), false));
+    assert!(ig.is_ignored(&cache.join("index.bin.tmp"), false));
+    // ...never by name alone: `manifest.json` is an ordinary source file in
+    // web-extension / PWA / Android projects and MUST stay indexable.
+    assert!(!ig.is_ignored(&tmp.path().join("manifest.json"), false));
+    assert!(!ig.is_ignored(&tmp.path().join("public/manifest.json"), false));
+    assert!(!ig.is_ignored(&tmp.path().join("index.bin"), false));
     assert!(!ig.is_ignored(&tmp.path().join("src/main.rs"), false));
     assert!(!ig.is_ignored(&tmp.path().join("a.txt"), false));
 }

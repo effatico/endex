@@ -441,6 +441,9 @@ impl Index {
 pub fn walk_files(root: &Path) -> Vec<PathBuf> {
     use ignore::WalkBuilder;
     let mut out = Vec::new();
+    // Resolved once: only files in THIS directory are ours. Matching on the
+    // bare names would hide every project's own `manifest.json`/`index.bin`.
+    let cache_dir = crate::store::cache_dir(root);
     for entry in WalkBuilder::new(root)
         .hidden(true)
         .git_ignore(true)
@@ -449,11 +452,9 @@ pub fn walk_files(root: &Path) -> Vec<PathBuf> {
         .parents(true)
         .follow_links(false)
         // Never index our own cache/manifest files, even in repos that
-        // don't gitignore them.
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !crate::store::SELF_WRITTEN.contains(&name.as_ref())
-        })
+        // don't gitignore them (i.e. when the cache falls back into the
+        // project dir, or the project dir *is* a cache dir).
+        .filter_entry(move |e| !crate::store::is_self_written(&cache_dir, e.path()))
         .build()
         .flatten()
     {

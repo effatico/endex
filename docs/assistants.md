@@ -2,7 +2,7 @@
 
 endex speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio: any MCP-capable assistant can use it. The pi extension additionally wraps it natively.
 
-The server is **always-on and low-latency**: a background watcher reindexes changed files (~1 ms), a background embedder keeps semantic vectors warm without blocking queries, and `endex_ask` only ever embeds the query (never the corpus inline). It reports `semantic_coverage` so you can tell when it's still warming up.
+The server is **always-on and low-latency**: a background watcher reindexes changed files (~1 ms), a background embedder keeps semantic vectors warm without blocking queries, and `endex_ask` only ever embeds the query (never the corpus inline). It reports `coverage` (0..1, the fraction of blocks with vectors) so you can tell when it's still warming up.
 
 ## MCP tools
 

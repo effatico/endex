@@ -1,6 +1,6 @@
 [package]
 name = "endex"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Extremely fast, cached, self-updating code indexer with millisecond substring search"
 license = "MIT"
@@ -24,7 +24,8 @@ notify = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = "1"
-sha2 = "0.10"
+# Already in the tree via ureq -> flate2, so this is a free dependency.
+crc32fast = "1"
 ureq = { version = "2", features = ["json"] }
 
 [profile.release]

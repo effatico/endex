@@ -47,7 +47,7 @@ OPTIONS:
   --embed-model M      e.g. embed-v4.0, text-embedding-3-small (env EMBED_MODEL)
   --embed-key KEY      API key (env EMBED_API_KEY / COHERE_API_KEY / OPENAI_API_KEY)
   --embed-dim N        hash embedding dimensions (default 256)
-  --embed-batch N      remote embedding batch size (default 64)
+  --embed-batch N      remote embedding batch size (default 96 cohere / 64 openai)
   --embed-rerank-model M  Cohere rerank model (default rerank-v3.5,
                        env EMBED_RERANK_MODEL; cohere provider only)
 
@@ -57,10 +57,10 @@ REPL (watch mode):
   :clues TERM      blocks + symbols        :embed    build/refresh embeddings
   :limit N  :save  :stats  :quit
 
-The cache is stored under ~/.endex/cache/<repo_name> (one 'index.bin' plus a
-  'manifest.json' per project). The watcher and full walks always honor
-  .gitignore; hidden (dot) files and the cache files themselves are never
-  indexed."
+The cache is stored under ~/.endex/cache/<repo_name>-<hash> (one 'index.bin'
+  plus a 'manifest.json' per project); override the root with ENDEX_CACHE_DIR.
+  The watcher and full walks always honor .gitignore; hidden (dot) files and
+  the cache files themselves are never indexed."
     );
     std::process::exit(code);
 }
@@ -116,7 +116,11 @@ fn parse_opts(args: &[String]) -> Opts {
 }
 
 fn provider_from(opts: &Opts) -> embed::Provider {
-    embed::Provider::resolve(&opts.embed)
+    let (prov, notice) = embed::Provider::resolve_checked(&opts.embed);
+    if let Some(n) = notice {
+        eprintln!("note: {n}");
+    }
+    prov
 }
 
 // ---------- load-or-build ----------
@@ -221,7 +225,7 @@ fn cmd_ask(args: &[String]) {
                 if outcome.reranked { " + rerank" } else { "" },
                 prov.id()
             );
-            output::print_ask_hits(&idx, &outcome.hits, &query);
+            output::print_ask_hits(&idx, &outcome.hits, &query, outcome.reranked);
             if outcome.changed {
                 let _ = store::save(&idx, &root);
             }
@@ -638,7 +642,12 @@ Commands: :graph N  :flow A B  :clues T  :embed [provider]  :limit N  :save  :st
                                         if outcome.reranked { " + rerank" } else { "" },
                                         prov.id()
                                     );
-                                    output::print_ask_hits(&idx, &outcome.hits, &q);
+                                    output::print_ask_hits(
+                                        &idx,
+                                        &outcome.hits,
+                                        &q,
+                                        outcome.reranked,
+                                    );
                                 }
                                 Err(e) => {
                                     eprintln!("semantic search failed: {e}");

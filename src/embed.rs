@@ -115,12 +115,39 @@ impl Provider {
     /// COHERE_API_KEY / OPENAI_API_KEY, EMBED_DIM, EMBED_BATCH,
     /// EMBED_RERANK_MODEL. The default provider is Cohere.
     pub fn resolve(opts: &ProviderOpts) -> Provider {
+        Self::resolve_checked(opts).0
+    }
+
+    /// `resolve`, plus a one-line notice to show the user when the choice
+    /// was silently changed.
+    ///
+    /// Cohere is the default but needs an API key. When it was *defaulted*
+    /// into (not explicitly requested) and no key is configured, fall back
+    /// to the offline `hash` provider: otherwise every query pays a failing
+    /// network round-trip, and a default should never ship code off the
+    /// machine without the user opting in. An explicit `cohere` request is
+    /// always honored — the error then tells the user what is wrong.
+    pub fn resolve_checked(opts: &ProviderOpts) -> (Provider, Option<String>) {
         let env = |name: &str| std::env::var(name).ok().filter(|s| !s.is_empty());
-        let name = opts
-            .provider
-            .clone()
-            .or_else(|| env("EMBED_PROVIDER"))
-            .unwrap_or_else(|| "cohere".into());
+        let explicit = opts.provider.clone().or_else(|| env("EMBED_PROVIDER"));
+        let defaulted = explicit.is_none();
+        let prov = Self::build(opts, explicit.unwrap_or_else(|| "cohere".into()));
+        if defaulted && prov.kind == ProviderKind::Cohere && prov.key.is_empty() {
+            let fallback = Self::build(opts, "hash".into());
+            return (
+                fallback,
+                Some(
+                    "no COHERE_API_KEY / EMBED_API_KEY set — using the offline 'hash' provider; \
+                     set a key (or --embed-provider cohere) for real semantic search"
+                        .into(),
+                ),
+            );
+        }
+        (prov, None)
+    }
+
+    fn build(opts: &ProviderOpts, name: String) -> Provider {
+        let env = |name: &str| std::env::var(name).ok().filter(|s| !s.is_empty());
         match name.as_str() {
             "cohere" => Provider {
                 kind: ProviderKind::Cohere,
@@ -520,57 +547,81 @@ pub struct AskOutcome {
     pub reranked: bool,
 }
 
+/// Hard ceiling on the candidate pool sent to the reranker: one request,
+/// bounded cost and latency.
+const MAX_RERANK_POOL: usize = 100;
+
 /// Candidate pool size fed to the reranker: 4× the requested limit, capped
-/// at 40 — enough headroom for reranking to change the order without
-/// sending a huge document batch. Providers without a reranker get 1×.
+/// at `MAX_RERANK_POOL`. The pool is always >= limit, so a large `limit`
+/// still gets reranked (it just has less headroom to reorder — it never
+/// silently disables reranking). Providers without a reranker get 1×.
 pub fn rerank_pool(prov: &Provider, limit: usize) -> usize {
-    if !prov.supports_rerank() || limit >= 40 {
+    if !prov.supports_rerank() {
         return limit;
     }
-    (limit * 4).min(40)
+    limit.max((limit * 4).min(MAX_RERANK_POOL))
 }
 
 /// Cap per candidate text before sending it to the reranker: beyond this
 /// the API truncates anyway; smaller requests are cheaper and faster.
 const RERANK_DOC_CHARS: usize = 4000;
 
-/// Rerank fused candidates against the query, truncating to `limit`.
-/// Falls back to the original RRF order when the provider has no reranker
-/// or the call fails — reranking must never fail a query. Returns
-/// `(hits, reranked)`.
+/// Ask the provider to rank `texts` (candidate block bodies) against the
+/// query, returning `(index, relevance)` best-first. Texts are truncated to
+/// `RERANK_DOC_CHARS` here so callers don't have to. `None` = no reranker,
+/// nothing to rank, or the call failed — callers keep their existing order.
+///
+/// This performs the HTTP round-trip and touches no index state, so servers
+/// can call it with every lock released.
+pub fn rerank_order(prov: &Provider, query: &str, texts: &[&str]) -> Option<Vec<(usize, f32)>> {
+    // <=1 candidate: nothing to reorder, don't spend a request on it.
+    if !prov.supports_rerank() || texts.len() <= 1 {
+        return None;
+    }
+    let docs: Vec<String> = texts
+        .iter()
+        .map(|t| t.chars().take(RERANK_DOC_CHARS).collect())
+        .collect();
+    let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+    prov.rerank(query, &refs).filter(|o| !o.is_empty())
+}
+
+/// Apply a `rerank_order` result to any vector of scored items, replacing
+/// each item's score with its relevance and truncating to `limit`.
+/// Generic so servers can reorder already-enriched records instead of
+/// re-resolving ids against a possibly-changed index afterwards.
+pub fn apply_rerank_order<T>(
+    items: Vec<(f32, T)>,
+    order: Vec<(usize, f32)>,
+    limit: usize,
+) -> Vec<(f32, T)> {
+    // Move items out by index (T is not necessarily Clone).
+    let mut slots: Vec<Option<(f32, T)>> = items.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .take(limit)
+        .filter_map(|(i, score)| {
+            slots
+                .get_mut(i)
+                .and_then(Option::take)
+                .map(|(_, v)| (score, v))
+        })
+        .collect()
+}
+
+/// Rerank fused hits against the query, truncating to `limit`. Falls back
+/// to the original RRF order when the provider has no reranker or the call
+/// fails — reranking must never fail a query. Returns `(hits, reranked)`.
 pub fn rerank_fused(
     prov: &Provider,
     mut fused: Vec<(f32, search::Hit)>,
     query: &str,
     limit: usize,
 ) -> (Vec<(f32, search::Hit)>, bool) {
-    if !prov.supports_rerank() || fused.len() <= limit {
-        fused.truncate(limit);
-        return (fused, false);
-    }
-    let docs: Vec<String> = fused
-        .iter()
-        .map(|(_, h)| h.text.chars().take(RERANK_DOC_CHARS).collect())
-        .collect();
-    let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
-    match prov.rerank(query, &refs) {
-        Some(order) if !order.is_empty() => {
-            // Move hits out of the fused vector (Hit is not Clone).
-            let mut slots: Vec<Option<(f32, search::Hit)>> =
-                fused.into_iter().map(Some).collect();
-            let out: Vec<(f32, search::Hit)> = order
-                .into_iter()
-                .take(limit)
-                .filter_map(|(i, score)| {
-                    slots
-                        .get_mut(i)
-                        .and_then(Option::take)
-                        .map(|(_, h)| (score, h))
-                })
-                .collect();
-            (out, true)
-        }
-        _ => {
+    let texts: Vec<&str> = fused.iter().map(|(_, h)| h.text.as_str()).collect();
+    match rerank_order(prov, query, &texts) {
+        Some(order) => (apply_rerank_order(fused, order, limit), true),
+        None => {
             fused.truncate(limit);
             (fused, false)
         }

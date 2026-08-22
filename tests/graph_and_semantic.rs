@@ -1,17 +1,26 @@
 //! Tests for the knowledge graph, embeddings, and hybrid search.
 
-use endex::{embed, index::Index, search};
+use endex::{embed, index::Index, search, store};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Once;
 
 static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+static CACHE_ENV: Once = Once::new();
 
 struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
+        // Redirect the on-disk cache into the system temp dir: tests must
+        // never write into the developer's real ~/.endex/cache. Set once
+        // per test process, before any store path is resolved.
+        CACHE_ENV.call_once(|| {
+            let d = std::env::temp_dir().join(format!("endex-test-cache-{}", std::process::id()));
+            std::env::set_var("ENDEX_CACHE_DIR", &d);
+        });
         let n = DIR_SEQ.fetch_add(1, Ordering::SeqCst);
         let p = std::env::temp_dir().join(format!(
             "endex-graph-test-{}-{}-{}",
@@ -40,6 +49,10 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
+        // Resolve the cache dir BEFORE deleting the project (it canonicalizes
+        // the root), so no cache leaks behind after the test run.
+        let cache = store::cache_dir(&self.0);
+        let _ = fs::remove_dir_all(&cache);
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -244,7 +257,9 @@ fn hybrid_search_finds_relevant_blocks() {
     // The hash provider has no reranker, so RRF order is kept.
     assert!(!outcome.reranked);
     assert!(!outcome.hits.is_empty());
-    assert!(idx.path_of(outcome.hits[0].1.file_id).contains("billing.ts"));
+    assert!(idx
+        .path_of(outcome.hits[0].1.file_id)
+        .contains("billing.ts"));
 
     // Pure lexical search still works independently.
     assert_eq!(search::search(&idx, "processInvoicePayment", 5).len(), 1);
@@ -300,4 +315,107 @@ fn provider_switch_invalidates_embeddings() {
     embed::ensure_all(&mut idx, &p128).unwrap();
     assert_eq!(idx.embeddings.provider_id, p128.id());
     assert_eq!(idx.embeddings.map.len(), 1);
+}
+
+// ---------- reranking ----------
+
+fn cohere_provider() -> embed::Provider {
+    // Resolved with an explicit key so `supports_rerank()` is true; no
+    // request is ever made in these tests.
+    embed::Provider::resolve(&embed::ProviderOpts {
+        provider: Some("cohere".into()),
+        key: Some("test-key".into()),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn rerank_pool_never_disables_reranking_for_large_limits() {
+    let cohere = cohere_provider();
+    assert!(cohere.supports_rerank());
+    // Small limits get 4x headroom...
+    assert_eq!(embed::rerank_pool(&cohere, 5), 20);
+    assert_eq!(embed::rerank_pool(&cohere, 20), 80);
+    // ...large ones are capped, but the pool is ALWAYS >= limit, so a big
+    // limit still gets reranked instead of silently falling back to RRF.
+    for limit in [39, 40, 50, 100] {
+        let pool = embed::rerank_pool(&cohere, limit);
+        assert!(pool >= limit, "pool {pool} must cover limit {limit}");
+    }
+    // Providers without a reranker never over-fetch.
+    let hash = hash_provider();
+    assert_eq!(embed::rerank_pool(&hash, 50), 50);
+}
+
+#[test]
+fn apply_rerank_order_reorders_scores_and_truncates() {
+    let items: Vec<(f32, &str)> = vec![(0.1, "a"), (0.2, "b"), (0.3, "c")];
+    // Reranker says: c best, then a.
+    let order = vec![(2usize, 0.9f32), (0usize, 0.5f32), (1usize, 0.1f32)];
+    let out = embed::apply_rerank_order(items, order, 2);
+    assert_eq!(out.len(), 2, "truncated to limit");
+    assert_eq!(out[0].1, "c");
+    assert_eq!(out[1].1, "a");
+    assert!((out[0].0 - 0.9).abs() < 1e-6, "score replaced by relevance");
+}
+
+#[test]
+fn apply_rerank_order_ignores_out_of_range_and_duplicate_indices() {
+    // A malformed provider response must not panic or duplicate hits.
+    let items: Vec<(f32, &str)> = vec![(0.1, "a"), (0.2, "b")];
+    let order = vec![(99usize, 1.0f32), (1usize, 0.8f32), (1usize, 0.7f32)];
+    let out = embed::apply_rerank_order(items, order, 10);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].1, "b");
+}
+
+#[test]
+fn rerank_order_is_none_without_a_reranker_or_candidates() {
+    let hash = hash_provider();
+    assert!(embed::rerank_order(&hash, "q", &["a", "b"]).is_none());
+    // A single candidate is not worth a request.
+    let cohere = cohere_provider();
+    assert!(embed::rerank_order(&cohere, "q", &["only"]).is_none());
+    assert!(embed::rerank_order(&cohere, "q", &[]).is_none());
+}
+
+// ---------- provider defaults ----------
+
+#[test]
+fn cohere_default_without_key_falls_back_to_offline_hash() {
+    // Guard the privacy/behavior default: a bare `endex ask` with no key
+    // must not try to ship code to an external API on every query.
+    let saved: Vec<(&str, Option<String>)> = ["EMBED_PROVIDER", "EMBED_API_KEY", "COHERE_API_KEY"]
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect();
+    for (k, _) in &saved {
+        std::env::remove_var(k);
+    }
+
+    let (prov, notice) = embed::Provider::resolve_checked(&embed::ProviderOpts::default());
+    assert_eq!(prov.kind, embed::ProviderKind::Hash);
+    assert!(notice.is_some(), "the downgrade must be announced");
+
+    // An EXPLICIT cohere request is always honored, key or not.
+    let (explicit, _) = embed::Provider::resolve_checked(&embed::ProviderOpts {
+        provider: Some("cohere".into()),
+        ..Default::default()
+    });
+    assert_eq!(explicit.kind, embed::ProviderKind::Cohere);
+
+    // With a key, the default stays Cohere.
+    let (keyed, notice) = embed::Provider::resolve_checked(&embed::ProviderOpts {
+        key: Some("k".into()),
+        ..Default::default()
+    });
+    assert_eq!(keyed.kind, embed::ProviderKind::Cohere);
+    assert!(notice.is_none());
+
+    for (k, v) in saved {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
 }

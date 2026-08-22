@@ -5,14 +5,23 @@ use endex::{index::Index, search, store};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Once;
 
 static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+static CACHE_ENV: Once = Once::new();
 
 /// Unique temp dir per test, cleaned up on drop.
 struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
+        // Redirect the on-disk cache into the system temp dir: tests must
+        // never write into the developer's real ~/.endex/cache. Set once
+        // per test process, before any store path is resolved.
+        CACHE_ENV.call_once(|| {
+            let d = std::env::temp_dir().join(format!("endex-test-cache-{}", std::process::id()));
+            std::env::set_var("ENDEX_CACHE_DIR", &d);
+        });
         let n = DIR_SEQ.fetch_add(1, Ordering::SeqCst);
         let p = std::env::temp_dir().join(format!(
             "endex-test-{}-{}-{}",
@@ -41,10 +50,13 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
+        // Resolve the cache dir BEFORE deleting the project (it canonicalizes
+        // the root), so no cache leaks behind after the test run.
+        let cache = store::cache_dir(&self.0);
+        let _ = fs::remove_dir_all(&cache);
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-
 fn hit_paths(idx: &Index, q: &str) -> Vec<String> {
     search::search(idx, q, 100)
         .into_iter()
@@ -210,13 +222,16 @@ fn cache_rejects_tampered_payload() {
     store::save(&idx, tmp.path()).unwrap();
     assert!(store::load(tmp.path()).is_some());
 
-    // Flip one byte in the payload — the trailing digest must catch it.
+    // Flip one byte in the payload — the trailing checksum must catch it.
     let p = store::cache_path(tmp.path());
     let mut buf = fs::read(&p).unwrap();
     let mid = buf.len() / 2;
     buf[mid] ^= 0x01;
     fs::write(&p, &buf).unwrap();
-    assert!(store::load(tmp.path()).is_none(), "tampered cache must fail");
+    assert!(
+        store::load(tmp.path()).is_none(),
+        "tampered cache must fail"
+    );
     fs::remove_file(&p).ok();
 }
 
@@ -234,4 +249,106 @@ fn results_ranked_by_occurrence_count() {
     assert_eq!(hits.len(), 2);
     assert!(idx.path_of(hits[0].file_id).contains("thrice"));
     assert!(idx.path_of(hits[1].file_id).contains("once"));
+}
+
+// ---------- self-written filtering ----------
+
+#[test]
+fn project_manifest_and_index_files_are_indexable() {
+    // Regression: `manifest.json` / `index.bin` are our cache filenames, but
+    // they are also perfectly ordinary project files (web extensions, PWAs,
+    // Android, ...). Filtering them by BASENAME silently hid them from the
+    // index; only files inside the cache dir may be skipped.
+    let tmp = TempDir::new();
+    tmp.write("manifest.json", "{\"name\": \"uniq_probe_manifest\"}\n");
+    tmp.write(
+        "public/manifest.json",
+        "{\"short_name\": \"uniq_probe_pwa\"}\n",
+    );
+    tmp.write("index.bin", "uniq_probe_binfile\n");
+    tmp.write("a.rs", "fn unrelated() {}\n");
+
+    let mut idx = Index::new(tmp.path());
+    idx.build(tmp.path());
+
+    assert_eq!(idx.file_count(), 4, "all four files must be indexed");
+    assert_eq!(search::search(&idx, "uniq_probe_manifest", 10).len(), 1);
+    assert_eq!(search::search(&idx, "uniq_probe_pwa", 10).len(), 1);
+    assert_eq!(search::search(&idx, "uniq_probe_binfile", 10).len(), 1);
+}
+
+#[test]
+fn cache_artifacts_are_never_indexed() {
+    // The mirror image: when the cache lands inside the indexed tree (no
+    // home dir / ENDEX_CACHE_DIR pointing inside), it must not be ingested.
+    let tmp = TempDir::new();
+    tmp.write("a.rs", "fn find_me() {}\n");
+    let mut idx = Index::new(tmp.path());
+    idx.build(tmp.path());
+    store::save(&idx, tmp.path()).unwrap();
+
+    let cache = store::cache_dir(tmp.path());
+    for f in ["index.bin", "manifest.json", "index.bin.tmp"] {
+        assert!(
+            store::is_self_written(&cache, &cache.join(f)),
+            "{f} in the cache dir is self-written"
+        );
+        assert!(
+            !store::is_self_written(&cache, &tmp.path().join(f)),
+            "{f} in the project dir is NOT self-written"
+        );
+    }
+}
+
+#[test]
+fn tmp_files_use_sibling_suffix_names() {
+    // `Path::with_extension("tmp")` would turn index.bin -> index.tmp, which
+    // is not in SELF_WRITTEN and would leak into the index mid-write.
+    let tmp = TempDir::new();
+    let cache = store::cache_dir(tmp.path());
+    for f in store::SELF_WRITTEN {
+        assert!(store::is_self_written(&cache, &cache.join(f)));
+    }
+    assert!(store::SELF_WRITTEN.contains(&"index.bin.tmp"));
+    assert!(store::SELF_WRITTEN.contains(&"manifest.json.tmp"));
+}
+
+#[test]
+fn v4_caches_still_load_after_upgrade() {
+    // A v4 cache (no trailing checksum) must still be readable, or upgrading
+    // silently throws away every cached embedding vector and forces a full
+    // (paid) re-embed.
+    let tmp = TempDir::new();
+    tmp.write("a.rs", "fn find_me() {}\n");
+    let mut idx = Index::new(tmp.path());
+    idx.build(tmp.path());
+    store::save(&idx, tmp.path()).unwrap();
+
+    let p = store::cache_path(tmp.path());
+    let v5 = fs::read(&p).unwrap();
+    // Rewrite as v4: old magic byte, payload without the trailing checksum.
+    let mut v4 = v5.clone();
+    v4[8] = 0x04;
+    v4.truncate(v4.len() - store::CHECKSUM_LEN);
+    fs::write(&p, &v4).unwrap();
+
+    let loaded = store::load(tmp.path()).expect("v4 cache must still load");
+    assert_eq!(loaded.file_count(), idx.file_count());
+    assert_eq!(search::search(&loaded, "find_me", 10).len(), 1);
+}
+
+#[test]
+fn truncated_cache_is_rejected() {
+    let tmp = TempDir::new();
+    tmp.write("a.rs", "fn find_me() {}\n");
+    let mut idx = Index::new(tmp.path());
+    idx.build(tmp.path());
+    store::save(&idx, tmp.path()).unwrap();
+
+    let p = store::cache_path(tmp.path());
+    let mut buf = fs::read(&p).unwrap();
+    // Eat the checksum and part of the payload.
+    buf.truncate(buf.len() - (store::CHECKSUM_LEN + 8));
+    fs::write(&p, &buf).unwrap();
+    assert!(store::load(tmp.path()).is_none());
 }

@@ -350,6 +350,32 @@ fn round_score(x: f32) -> f64 {
     (x as f64 * 1e4).round() / 1e4
 }
 
+/// Fully resolve one `ask` hit into its JSON record: file path plus the
+/// symbols defined in the block (ideal follow-up inputs for endex_graph /
+/// endex_flow). MUST be called while holding the lock that produced the
+/// hit — `file_id` / `block_id` are recycled on reindex.
+fn ask_hit_json(idx: &Index, h: &search::Hit, score: f32) -> Value {
+    let g = &idx.graph;
+    let syms: Vec<Value> = g
+        .by_block
+        .get(&h.block_id)
+        .map(|ids| {
+            ids.iter()
+                .take(8)
+                .filter_map(|&id| g.symbols.get(id as usize))
+                .map(|s| json!({ "name": s.name, "kind": s.kind.label() }))
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "file": idx.path_of(h.file_id),
+        "line": h.line,
+        "score": round_score(score),
+        "symbols": syms,
+        "text": h.text,
+    })
+}
+
 fn resolve_symbol(idx: &Index, g: &Graph, id: u32) -> Value {
     let s = &g.symbols[id as usize];
     json!({
@@ -422,7 +448,8 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
                 "symbols": idx.graph.symbols.len(),
                 "call_edges": idx.graph.call_edge_count(),
                 "import_edges": idx.graph.file_imports.len(),
-                "semantic_coverage": coverage(idx, &emb),
+                // Named `coverage` everywhere (endex_ask, endex_stats).
+                "coverage": coverage(idx, &emb),
                 "message": "index ready (filesystem watcher active; changes are picked up automatically)"
             });
             let m = meta(&sh, payload, t0.elapsed().as_secs_f64() * 1000.0);
@@ -478,18 +505,19 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
             let qv = provider.embed_query(query);
             let pool = embed::rerank_pool(provider, limit);
             // 2. Fuse lexical + semantic rankings into a candidate pool
-            //    sized for the reranker (locks held only for in-memory
-            //    scoring; the Hit text is owned, guards drop here).
-            let (fused, cov, warn) = {
+            //    sized for the reranker, and fully resolve every hit
+            //    (path + symbols) WHILE STILL HOLDING THE LOCK. File and
+            //    block ids are recycled by the watcher on reindex, so they
+            //    must never outlive the guard that produced them.
+            let (mut cands, cov, warn) = {
                 let sh_arc = shared();
                 let sh = mlock(&sh_arc);
                 let idx = &sh.idx;
                 let emb_arc = emb();
                 let emb = rlock(&emb_arc);
-                match &qv {
+                let (hits, cov, warn) = match &qv {
                     Ok(qv) => {
-                        let (hits, cov) =
-                            embed::ask_fast_with_qv(idx, &emb, qv, query, pool);
+                        let (hits, cov) = embed::ask_fast_with_qv(idx, &emb, qv, query, pool);
                         (hits, cov, None)
                     }
                     Err(e) => (
@@ -503,46 +531,35 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
                             "semantic provider unavailable ({e}); results are lexical only"
                         )),
                     ),
+                };
+                let cands: Vec<(f32, Value)> = hits
+                    .into_iter()
+                    .map(|(score, h)| (score, ask_hit_json(idx, &h, score)))
+                    .collect();
+                (cands, cov, warn)
+            };
+            // 3. Rerank with NO locks held (this is an HTTP call). Skipped
+            //    when the embedding call already failed; internally a no-op
+            //    for providers without a reranker. Only scores and order
+            //    change here — the records are already resolved.
+            let mut reranked = false;
+            if warn.is_none() {
+                let texts: Vec<&str> = cands
+                    .iter()
+                    .map(|(_, v)| v["text"].as_str().unwrap_or(""))
+                    .collect();
+                if let Some(order) = embed::rerank_order(provider, query, &texts) {
+                    cands = embed::apply_rerank_order(cands, order, limit);
+                    reranked = true;
                 }
-            };
-            // 3. Rerank with NO locks held (outside HTTP call). Skipped
-            //    when the embedding call already failed; internally a
-            //    no-op for providers without a reranker.
-            let (hits, reranked) = if warn.is_some() {
-                (fused, false)
-            } else {
-                embed::rerank_fused(provider, fused, query, limit)
-            };
-            // 4. Brief lock to enrich hits with file paths and the symbols
-            //    defined in each block: symbol names are ideal follow-up
-            //    inputs for endex_graph / endex_flow.
-            let sh_arc = shared();
-            let sh = mlock(&sh_arc);
-            let idx = &sh.idx;
-            let g = &idx.graph;
-            let out: Vec<Value> = hits
-                .iter()
-                .map(|(score, h)| {
-                    let syms: Vec<Value> = g
-                        .by_block
-                        .get(&h.block_id)
-                        .map(|ids| {
-                            ids.iter()
-                                .take(8)
-                                .map(|&id| {
-                                    let s = &g.symbols[id as usize];
-                                    json!({ "name": s.name, "kind": s.kind.label() })
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    json!({
-                        "file": idx.path_of(h.file_id),
-                        "line": h.line,
-                        "score": round_score(*score),
-                        "symbols": syms,
-                        "text": h.text,
-                    })
+            }
+            cands.truncate(limit);
+            let out: Vec<Value> = cands
+                .into_iter()
+                .map(|(score, mut v)| {
+                    // Reranking replaced the RRF weight with a relevance score.
+                    v["score"] = json!(round_score(score));
+                    v
                 })
                 .collect();
             let mut payload = json!({
@@ -556,7 +573,7 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
                 } else {
                     "rrf"
                 },
-                "count": hits.len(),
+                "count": out.len(),
                 "hits": out,
             });
             // Conditional fields only: keep the default output compact.
@@ -566,6 +583,8 @@ fn exec_tool(provider: &Provider, name: &str, args: &Value) -> Value {
             if cov < 0.95 && payload.get("warning").is_none() {
                 payload["warming_up"] = json!(true);
             }
+            let sh_arc = shared();
+            let sh = mlock(&sh_arc);
             let m = meta(&sh, payload, t0.elapsed().as_secs_f64() * 1000.0);
             tool_ok(m.to_string())
         }
@@ -994,7 +1013,7 @@ pub fn run(dir: String, use_cache: bool, provider: Provider) {
 
     if provider.kind == embed::ProviderKind::Cohere && provider.key.is_empty() {
         eprintln!(
-            "endex MCP: Cohere is the default provider but no API key is set \
+            "endex MCP: Cohere was requested but no API key is set \
              (COHERE_API_KEY / EMBED_API_KEY) — queries degrade to lexical \
              results until a key is configured; use --embed-provider hash \
              for fully offline search"

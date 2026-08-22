@@ -8,39 +8,82 @@
 //!
 //! Caches live in `~/.endex/cache/<repo_name>-<hash_of_project_path>/`
 //! (falling back to the project dir itself when there is no home dir), so
-//! indexed project directories stay clean.
-
-//! The payload carries a trailing SHA-256 digest so `load` can detect a
-//! tampered/corrupt cache and fall back to a rebuild (plain integrity, not
-//! a keyed/MAC guarantee — an attacker who can write the cache file can
-//! also recompute the digest).
+//! indexed project directories stay clean. `ENDEX_CACHE_DIR` overrides the
+//! `~/.endex/cache` root (useful for tests and sandboxed environments).
+//!
+//! The v5 payload carries a trailing CRC-32 checksum so `load` can detect a
+//! corrupt or truncated cache and fall back to a rebuild. This is an
+//! accident detector, NOT a security boundary: anyone who can write the
+//! cache file can trivially recompute the checksum, exactly as they could
+//! recompute a bare SHA-256. Since a keyed MAC is the only thing that would
+//! change that, and we aren't doing key management for a rebuildable cache,
+//! we use the cheapest adequate check — `crc32fast` is already in the
+//! dependency tree via `ureq -> flate2`, whereas SHA-256 pulled in seven
+//! extra crates to solve a threat model we don't have.
+//!
+//! v4 files (payload only) are still *read* so an upgrade does not throw
+//! away expensive embedding vectors; they are rewritten as v5 on the next
+//! save.
 
 use crate::index::Index;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 10] = b"ENDEXIDX\x04\x00"; // v4: + per-block content hash
+/// Current format: MAGIC | bincode payload | CRC-32(payload), little-endian.
+const MAGIC: &[u8; 10] = b"ENDEXIDX\x05\x00";
+/// Legacy format: MAGIC | bincode payload. Same schema as v5, no checksum.
+/// Read-only — never written.
+const MAGIC_V4: &[u8; 10] = b"ENDEXIDX\x04\x00";
 
-/// Bytes in the trailing SHA-256 integrity digest appended to the payload.
-const DIGEST_LEN: usize = 32;
+/// Bytes in the trailing CRC-32 checksum appended to the payload.
+pub const CHECKSUM_LEN: usize = 4;
+
+fn checksum(bytes: &[u8]) -> u32 {
+    let mut h = crc32fast::Hasher::new();
+    h.update(bytes);
+    h.finalize()
+}
 
 /// Cache format version of the current MAGIC header (bumped on schema change).
-pub const CACHE_VERSION: u32 = 4;
+pub const CACHE_VERSION: u32 = 5;
 
-/// Filenames the tool writes into its cache directory (`~/.endex/cache/...`).
-/// Watchers and walkers must ignore these names or the index re-ingests its
-/// own output forever (relevant when the cache falls back into the project
-/// dir, or when the project dir is a cache dir).
+pub const INDEX_FILE: &str = "index.bin";
+pub const MANIFEST_FILE: &str = "manifest.json";
+
+/// Filenames the tool writes into its cache directory. Walkers and watchers
+/// must skip them *inside that directory* or the index re-ingests its own
+/// output forever — see `is_self_written`, which is path-scoped on purpose:
+/// `manifest.json` is a perfectly ordinary source file in most projects and
+/// must never be filtered by name alone.
 pub const SELF_WRITTEN: &[&str] = &[
-    "index.bin",
+    INDEX_FILE,
     "index.bin.tmp",
-    "manifest.json",
+    MANIFEST_FILE,
     "manifest.json.tmp",
 ];
+
+/// True if `path` is one of our own cache artifacts, i.e. it lives directly
+/// in `cache_dir` and has one of the `SELF_WRITTEN` names. Callers should
+/// compute `cache_dir(root)` once and reuse it (it canonicalizes).
+pub fn is_self_written(cache_dir: &Path, path: &Path) -> bool {
+    path.parent() == Some(cache_dir)
+        && path
+            .file_name()
+            .is_some_and(|n| SELF_WRITTEN.contains(&n.to_string_lossy().as_ref()))
+}
+
+/// Sibling temp path for atomic writes: `index.bin` -> `index.bin.tmp`.
+/// (`Path::with_extension` would produce `index.tmp`, which does not match
+/// `SELF_WRITTEN` and would leak into the index.)
+fn tmp_path(p: &Path) -> PathBuf {
+    let mut s: OsString = p.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Manifest {
@@ -59,12 +102,18 @@ pub struct Manifest {
 /// `~/.endex/cache/<repo_name>-<hash_of_project_path>` (falls back to the
 /// project dir itself when there is no home directory). The hash suffix
 /// keeps two different projects with the same directory name apart.
-fn cache_dir(root: &Path) -> std::path::PathBuf {
-    let home = env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| env::var_os("USERPROFILE").map(std::path::PathBuf::from));
-    let Some(home) = home else {
+/// `ENDEX_CACHE_DIR` overrides the `~/.endex/cache` root.
+///
+/// Canonicalizes `root`, so callers in hot paths should call it once.
+pub fn cache_dir(root: &Path) -> PathBuf {
+    let base = match env::var_os("ENDEX_CACHE_DIR").filter(|v| !v.is_empty()) {
+        Some(v) => Some(PathBuf::from(v)),
+        None => env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .or_else(|| env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+            .map(|h| PathBuf::from(h).join(".endex").join("cache")),
+    };
+    let Some(base) = base else {
         return root.to_path_buf();
     };
     let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -84,36 +133,31 @@ fn cache_dir(root: &Path) -> std::path::PathBuf {
         })
         .collect();
     let hash = crate::embed::fnv64(&canon.to_string_lossy());
-    home.join(".endex")
-        .join("cache")
-        .join(format!("{name}-{hash:016x}"))
+    base.join(format!("{name}-{hash:016x}"))
 }
 
-pub fn cache_path(root: &Path) -> std::path::PathBuf {
-    cache_dir(root).join("index.bin")
+pub fn cache_path(root: &Path) -> PathBuf {
+    cache_dir(root).join(INDEX_FILE)
 }
 
-pub fn manifest_path(root: &Path) -> std::path::PathBuf {
-    cache_dir(root).join("manifest.json")
+pub fn manifest_path(root: &Path) -> PathBuf {
+    cache_dir(root).join(MANIFEST_FILE)
 }
 
 pub fn save(index: &Index, root: &Path) -> io::Result<()> {
-    let path = cache_path(root);
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
+    // One canonicalizing lookup for both files.
+    let dir = cache_dir(root);
+    let path = dir.join(INDEX_FILE);
+    fs::create_dir_all(&dir)?;
     let t0 = std::time::Instant::now();
-    // Layout: MAGIC | bincode payload | SHA-256(payload). A trailing digest
-    // keeps older readers compatible (they deserialize payload and ignore
-    // the tag); `Sha256::digest` copies and does not move the buffer.
+    // Layout: MAGIC | bincode payload | CRC-32(payload) little-endian.
     let data = bincode::serialize(index).map_err(io::Error::other)?;
-    let digest = Sha256::digest(&data);
-    let mut buf = Vec::with_capacity(data.len() + MAGIC.len() + DIGEST_LEN);
+    let mut buf = Vec::with_capacity(data.len() + MAGIC.len() + CHECKSUM_LEN);
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&data);
-    buf.extend_from_slice(&digest);
+    buf.extend_from_slice(&checksum(&data).to_le_bytes());
 
-    let tmp = path.with_extension("tmp");
+    let tmp = tmp_path(&path);
     fs::write(&tmp, &buf)?;
     fs::rename(&tmp, &path)?; // atomic on POSIX
     eprintln!(
@@ -132,17 +176,15 @@ pub fn save(index: &Index, root: &Path) -> io::Result<()> {
         embedding_dim: index.embeddings.dim,
     };
     if let Ok(json) = serde_json::to_string_pretty(&manifest) {
-        let mtmp = manifest_path(root).with_extension("tmp");
+        let mpath = dir.join(MANIFEST_FILE);
+        let mtmp = tmp_path(&mpath);
         if fs::write(&mtmp, &json).is_ok() {
-            let _ = fs::rename(&mtmp, manifest_path(root));
+            let _ = fs::rename(&mtmp, &mpath);
         }
     }
     Ok(())
 }
 
-/// Read the manifest without touching the big index. Returns None if the
-/// manifest is missing/corrupt — callers should then fall back to a full
-/// load.
 /// Cache file metadata without deserializing the index: path, size,
 /// modified time. Combined with `load_manifest` by callers.
 pub struct CacheInfo {
@@ -166,6 +208,9 @@ pub fn cache_info(root: &Path) -> Option<CacheInfo> {
     })
 }
 
+/// Read the manifest without touching the big index. Returns None if the
+/// manifest is missing/corrupt — callers should then fall back to a full
+/// load.
 pub fn load_manifest(root: &Path) -> Option<Manifest> {
     let s = fs::read_to_string(manifest_path(root)).ok()?;
     serde_json::from_str(&s).ok()
@@ -174,21 +219,24 @@ pub fn load_manifest(root: &Path) -> Option<Manifest> {
 pub fn load(root: &Path) -> Option<Index> {
     let path = cache_path(root);
     let buf = fs::read(&path).ok()?;
-    if buf.len() < MAGIC.len() || &buf[..MAGIC.len()] != MAGIC {
-        return None; // unknown/corrupt cache
+    if buf.len() < MAGIC.len() {
+        return None;
     }
-    let payload = &buf[MAGIC.len()..];
-    // Decide the serialized body: if a trailing digest is present it must
-    // verify (mismatch = tamper/corruption → rebuild). Digest-less files
-    // (older version) serialize the whole payload as before.
-    let body = if payload.len() > DIGEST_LEN {
-        let (b, tag) = payload.split_at(payload.len() - DIGEST_LEN);
-        if Sha256::digest(b).as_slice() != tag {
-            return None; // tampered or corrupt cache
+    let (header, payload) = buf.split_at(MAGIC.len());
+    // The header alone decides the framing — never guess from length, or a
+    // legacy payload gets read as checksum-protected and always "fails".
+    let body = match header {
+        h if h == MAGIC => {
+            let (b, tag) = payload.split_at(payload.len().checked_sub(CHECKSUM_LEN)?);
+            if checksum(b).to_le_bytes() != tag {
+                return None; // corrupt or truncated → rebuild
+            }
+            b
         }
-        b
-    } else {
-        payload
+        // v4: identical schema, no checksum. Accepted so upgrades keep their
+        // embedding vectors; the next save rewrites the file as v5.
+        h if h == MAGIC_V4 => payload,
+        _ => return None, // unknown/corrupt cache
     };
     bincode::deserialize(body).ok()
 }
