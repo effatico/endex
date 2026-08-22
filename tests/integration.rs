@@ -201,6 +201,25 @@ fn cache_rejects_garbage() {
     fs::remove_file(&p).ok();
 }
 
+#[test]
+fn cache_rejects_tampered_payload() {
+    let tmp = TempDir::new();
+    tmp.write("a.rs", "fn find_me() {}\n");
+    let mut idx = Index::new(tmp.path());
+    idx.build(tmp.path());
+    store::save(&idx, tmp.path()).unwrap();
+    assert!(store::load(tmp.path()).is_some());
+
+    // Flip one byte in the payload — the trailing digest must catch it.
+    let p = store::cache_path(tmp.path());
+    let mut buf = fs::read(&p).unwrap();
+    let mid = buf.len() / 2;
+    buf[mid] ^= 0x01;
+    fs::write(&p, &buf).unwrap();
+    assert!(store::load(tmp.path()).is_none(), "tampered cache must fail");
+    fs::remove_file(&p).ok();
+}
+
 // ---------- ranking ----------
 
 #[test]

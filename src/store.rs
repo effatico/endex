@@ -10,14 +10,23 @@
 //! (falling back to the project dir itself when there is no home dir), so
 //! indexed project directories stay clean.
 
+//! The payload carries a trailing SHA-256 digest so `load` can detect a
+//! tampered/corrupt cache and fall back to a rebuild (plain integrity, not
+//! a keyed/MAC guarantee — an attacker who can write the cache file can
+//! also recompute the digest).
+
 use crate::index::Index;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::io;
 use std::path::Path;
 
 const MAGIC: &[u8; 10] = b"ENDEXIDX\x04\x00"; // v4: + per-block content hash
+
+/// Bytes in the trailing SHA-256 integrity digest appended to the payload.
+const DIGEST_LEN: usize = 32;
 
 /// Cache format version of the current MAGIC header (bumped on schema change).
 pub const CACHE_VERSION: u32 = 4;
@@ -94,10 +103,15 @@ pub fn save(index: &Index, root: &Path) -> io::Result<()> {
         fs::create_dir_all(dir)?;
     }
     let t0 = std::time::Instant::now();
-    let mut data = bincode::serialize(index).map_err(io::Error::other)?;
-    let mut buf = Vec::with_capacity(data.len() + MAGIC.len());
+    // Layout: MAGIC | bincode payload | SHA-256(payload). A trailing digest
+    // keeps older readers compatible (they deserialize payload and ignore
+    // the tag); `Sha256::digest` copies and does not move the buffer.
+    let data = bincode::serialize(index).map_err(io::Error::other)?;
+    let digest = Sha256::digest(&data);
+    let mut buf = Vec::with_capacity(data.len() + MAGIC.len() + DIGEST_LEN);
     buf.extend_from_slice(MAGIC);
-    buf.append(&mut data);
+    buf.extend_from_slice(&data);
+    buf.extend_from_slice(&digest);
 
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, &buf)?;
@@ -163,5 +177,18 @@ pub fn load(root: &Path) -> Option<Index> {
     if buf.len() < MAGIC.len() || &buf[..MAGIC.len()] != MAGIC {
         return None; // unknown/corrupt cache
     }
-    bincode::deserialize(&buf[MAGIC.len()..]).ok()
+    let payload = &buf[MAGIC.len()..];
+    // Decide the serialized body: if a trailing digest is present it must
+    // verify (mismatch = tamper/corruption → rebuild). Digest-less files
+    // (older version) serialize the whole payload as before.
+    let body = if payload.len() > DIGEST_LEN {
+        let (b, tag) = payload.split_at(payload.len() - DIGEST_LEN);
+        if Sha256::digest(b).as_slice() != tag {
+            return None; // tampered or corrupt cache
+        }
+        b
+    } else {
+        payload
+    };
+    bincode::deserialize(body).ok()
 }
