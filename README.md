@@ -105,6 +105,6 @@ cargo fmt --all -- --check
 ENDEX_BIN=./target/release/endex node extensions/test-client.mjs
 ```
 
-Cutting a release: `git tag v0.3.0 && git push --tags` — the Release workflow builds binaries for Linux (x86_64/aarch64), macOS (Intel/Apple Silicon) and Windows with `.sha256` checksums, then update `Formula/endex.rb`.
+Cutting a release: `git tag v0.4.0 && git push --tags` — the Release workflow builds binaries for Linux (x86_64/aarch64), macOS (Intel/Apple Silicon) and Windows with `.sha256` checksums, then update `Formula/endex.rb`.
 
 MIT licensed. CI runs build + fmt + clippy + tests on Ubuntu and macOS.

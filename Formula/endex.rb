@@ -11,7 +11,7 @@
 class Endex < Formula
   desc "Fast cached code indexer with MCP server for AI coding assistants"
   homepage "https://github.com/effatico/endex"
-  version "0.3.0"
+  version "0.4.0"
   license "MIT"
 
   on_macos do

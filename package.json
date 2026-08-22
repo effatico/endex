@@ -1,6 +1,6 @@
 {
   "name": "endex",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Fast cached code indexer with millisecond search, knowledge graph, hybrid semantic search, and an MCP server for AI coding assistants",
   "type": "module",
   "license": "MIT",
